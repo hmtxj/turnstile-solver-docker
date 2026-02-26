@@ -11,8 +11,8 @@ WORKDIR /app
 # 安装 Python 依赖
 RUN pip install --no-cache-dir quart camoufox patchright psutil rich
 
-# 下载 Camoufox 浏览器引擎
-RUN python -c "from camoufox.sync_api import Camoufox; print('Camoufox ready')" 2>/dev/null || true
+# 下载 Camoufox 浏览器引擎（必须提前下载，否则服务启动耗时过长会导致 502）
+RUN python -m camoufox fetch
 
 # 复制 Solver 代码
 COPY *.py /app/
