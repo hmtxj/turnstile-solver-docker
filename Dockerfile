@@ -20,5 +20,5 @@ COPY *.py /app/
 # 暴露端口
 EXPOSE 5000
 
-# 启动命令：先启动虚拟显示器，再启动 Solver
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & export DISPLAY=:99 && python api_solver.py --browser_type camoufox --thread 3 --headless --port 5000"]
+# 启动命令：自适应 Zeabur 分配的端口，降低并发数为 1 防止小鸡爆内存
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & export DISPLAY=:99 && python api_solver.py --browser_type camoufox --thread 1 --headless --port ${PORT:-5000}"]
