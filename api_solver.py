@@ -678,12 +678,16 @@ class TurnstileAPIServer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Turnstile Solver API 服务")
-    parser.add_argument("--browser_type", default="camoufox", choices=["camoufox", "chromium", "chrome", "msedge"],
-                        help="浏览器类型 (默认: camoufox)")
-    parser.add_argument("--thread", type=int, default=3, help="浏览器并发数 (默认: 3)")
-    parser.add_argument("--port", type=int, default=5000, help="服务端口 (默认: 5000)")
-    parser.add_argument("--headless", action="store_true", help="无头模式运行")
-    parser.add_argument("--debug", action="store_true", help="调试模式")
+    parser.add_argument("--browser_type", default=os.getenv("SOLVER_BROWSER", "camoufox"), choices=["camoufox", "chromium", "chrome", "msedge"],
+                        help="浏览器类型 (默认: camoufox, 环境变量: SOLVER_BROWSER)")
+    parser.add_argument("--thread", type=int, default=int(os.getenv("SOLVER_THREADS", 3)), help="浏览器并发数 (默认: 3, 环境变量: SOLVER_THREADS)")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 5000)), help="服务端口 (默认: 5000, 环境变量: PORT)")
+    
+    headless_default = os.getenv("SOLVER_HEADLESS", "true").lower() in ("true", "1", "yes")
+    parser.add_argument("--headless", action="store_true", default=headless_default, help="无头模式运行 (环境变量: SOLVER_HEADLESS=true)")
+    
+    debug_default = os.getenv("SOLVER_DEBUG", "false").lower() in ("true", "1", "yes")
+    parser.add_argument("--debug", action="store_true", default=debug_default, help="调试模式 (环境变量: SOLVER_DEBUG=true)")
     args = parser.parse_args()
 
     server = TurnstileAPIServer(

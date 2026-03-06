@@ -8,6 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# 环境变量：让 Python stdout 直接输出不缓存；配置默认系统参数
+ENV PYTHONUNBUFFERED=1
+ENV SOLVER_THREADS=1
+ENV SOLVER_HEADLESS=true
+ENV SOLVER_BROWSER=camoufox
+
 # 安装 Python 依赖
 RUN pip install --no-cache-dir quart camoufox patchright psutil rich
 
@@ -20,5 +26,5 @@ COPY *.py /app/
 # 暴露端口
 EXPOSE 5000
 
-# 启动命令：自适应 Zeabur 分配的端口，降低并发数为 1 防止小鸡爆内存
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & export DISPLAY=:99 && python api_solver.py --browser_type camoufox --thread 1 --headless --port ${PORT:-5000}"]
+# 启动命令：自适应系统分配的端口（使用环境变量），并默认开启 Xvfb
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & export DISPLAY=:99 && python api_solver.py"]
