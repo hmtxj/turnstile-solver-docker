@@ -19,6 +19,7 @@ import random
 import logging
 import asyncio
 from typing import Optional
+from collections import deque
 import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
@@ -67,12 +68,22 @@ handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(handler)
 
 
-# 浏览器实例超过此次数后自动重启（释放内存泄漏）
-BROWSER_RESTART_THRESHOLD = 25
+# 浏览器实例达到软阈值后不再继续复用持久页面，优先做轻量换血
+BROWSER_SOFT_RECYCLE_THRESHOLD = 10
+# 浏览器实例超过此次数后自动重启（释放长时间运行累积的污染/泄漏）
+BROWSER_RESTART_THRESHOLD = 18
+# 持久页面连续复用上限，超过后强制创建干净上下文
+PAGE_REUSE_LIMIT = 4
 # 连续失败超过此次数后，强制重启浏览器（绕过 Cloudflare 风控标记）
-CONSECUTIVE_FAIL_RESTART = 3
+CONSECUTIVE_FAIL_RESTART = 2
 # 失败后冷却等待范围（秒），避免被风控快速标记
-FAIL_COOLDOWN_RANGE = (3, 8)
+FAIL_COOLDOWN_RANGE = (2, 5)
+# 浏览器重启后的恢复观察期
+RECOVERING_GRACE_SECONDS = 12
+# 最近结果窗口大小，用于健康分计算
+RESULT_WINDOW_SIZE = 40
+# 统计近期重启风暴的时间窗口
+RESTART_EVENT_WINDOW_SECONDS = 900
 # 获取浏览器的最长等待时间（秒），避免任务无限排队
 BROWSER_ACQUIRE_TIMEOUT = 10
 
@@ -94,6 +105,10 @@ class TurnstileAPIServer:
         self._consecutive_fails = {}
         # 持久页面缓存 {index: (context, page)}，避免每次重新加载
         self._persistent_pages = {}
+        # 浏览器运行态：记录连续失败、页面复用次数、恢复期等
+        self._browser_runtime = {}
+        self._recent_results = deque(maxlen=RESULT_WINDOW_SIZE)
+        self._restart_events = deque(maxlen=RESULT_WINDOW_SIZE)
         self.console = Console()
         self._task_states = {}
         self._admission_lock = asyncio.Lock()
@@ -164,6 +179,171 @@ class TurnstileAPIServer:
             payload["elapsed_time"] = round(max(time.time() - created_at, 0), 3)
         payload.setdefault("solution", None)
         return payload
+
+    def _get_browser_runtime(self, index: int) -> dict:
+        runtime = self._browser_runtime.get(index)
+        if runtime is None:
+            runtime = {
+                "task_count": 0,
+                "page_reuse_count": 0,
+                "consecutive_failures": 0,
+                "recent_failures": 0,
+                "last_success_at": 0.0,
+                "last_failure_at": 0.0,
+                "last_restart_at": 0.0,
+                "recovering_until": 0.0,
+                "cooling_until": 0.0,
+                "force_recycle_page": False,
+                "last_outcome": "",
+                "last_message": "",
+                "restart_count": 0,
+                "recycle_count": 0,
+            }
+            self._browser_runtime[index] = runtime
+        return runtime
+
+    async def _cleanup_persistent_page(self, index: int):
+        cached = self._persistent_pages.pop(index, None)
+        if not cached:
+            runtime = self._get_browser_runtime(index)
+            runtime["page_reuse_count"] = 0
+            return
+        context, page = cached
+        try:
+            await page.close()
+        except Exception:
+            pass
+        try:
+            await context.close()
+        except Exception:
+            pass
+        runtime = self._get_browser_runtime(index)
+        runtime["page_reuse_count"] = 0
+
+    def _mark_browser_recovering(self, index: int, seconds: float, reason: str = ""):
+        runtime = self._get_browser_runtime(index)
+        runtime["recovering_until"] = time.time() + max(seconds, 0)
+        if reason:
+            runtime["last_message"] = reason
+
+    def _mark_browser_cooling(self, index: int, seconds: float, reason: str = ""):
+        runtime = self._get_browser_runtime(index)
+        runtime["cooling_until"] = time.time() + max(seconds, 0)
+        if reason:
+            runtime["last_message"] = reason
+
+    def _record_recent_result(self, index: int, outcome: str, elapsed: float = 0.0, message: str = ""):
+        now = time.time()
+        self._recent_results.append({
+            "ts": now,
+            "browser_index": index,
+            "outcome": outcome,
+            "elapsed": round(max(elapsed or 0.0, 0.0), 3),
+            "message": message,
+        })
+        runtime = self._get_browser_runtime(index)
+        runtime["last_outcome"] = outcome
+        if message:
+            runtime["last_message"] = message
+
+    def _should_recycle_persistent_page(self, index: int, task_count: int) -> str:
+        runtime = self._get_browser_runtime(index)
+        if runtime.get("force_recycle_page"):
+            return "上次任务失败后要求丢弃持久页面"
+        if runtime.get("page_reuse_count", 0) >= PAGE_REUSE_LIMIT:
+            return f"持久页面已连续复用 {runtime['page_reuse_count']} 次"
+        if task_count >= BROWSER_SOFT_RECYCLE_THRESHOLD:
+            return f"浏览器已累计执行 {task_count} 次任务，执行软换血"
+        if runtime.get("consecutive_failures", 0) > 0:
+            return "浏览器存在连续失败记录，跳过页面复用"
+        return ""
+
+    def _build_health_snapshot(self) -> dict:
+        now = time.time()
+        runtimes = [self._get_browser_runtime(i) for i in range(1, self.thread_count + 1)]
+        recent_results = list(self._recent_results)
+        recent_total = len(recent_results)
+        recent_success_count = sum(1 for item in recent_results if item["outcome"] == "success")
+        recent_fail_count = recent_total - recent_success_count
+        recent_timeout_count = sum(1 for item in recent_results if item["outcome"] == "timeout")
+        recent_captcha_fail_count = sum(1 for item in recent_results if item["outcome"] in {"timeout", "exception"})
+        elapsed_values = [item["elapsed"] for item in recent_results if item.get("elapsed", 0) > 0]
+        avg_solve_seconds_recent = round(sum(elapsed_values) / len(elapsed_values), 3) if elapsed_values else 0.0
+        recovering_browsers = sum(1 for runtime in runtimes if runtime.get("recovering_until", 0) > now)
+        cooling_browsers = sum(1 for runtime in runtimes if runtime.get("cooling_until", 0) > now)
+        page_recycle_pending = sum(1 for runtime in runtimes if runtime.get("force_recycle_page"))
+        browser_restart_count_recent = sum(1 for ts in self._restart_events if now - ts <= RESTART_EVENT_WINDOW_SECONDS)
+        last_success_at = max((runtime.get("last_success_at", 0.0) for runtime in runtimes), default=0.0)
+        last_failure_at = max((runtime.get("last_failure_at", 0.0) for runtime in runtimes), default=0.0)
+        fail_ratio = (recent_fail_count / recent_total) if recent_total else 0.0
+
+        health_score = 100
+        health_score -= int(fail_ratio * 55)
+        if avg_solve_seconds_recent > 12:
+            health_score -= min(int((avg_solve_seconds_recent - 12) * 3), 20)
+        health_score -= min(recent_timeout_count * 6, 18)
+        health_score -= cooling_browsers * 10
+        health_score -= recovering_browsers * 8
+        health_score -= page_recycle_pending * 6
+        health_score -= min(max(browser_restart_count_recent - self.thread_count, 0) * 2, 10)
+        health_score = max(min(health_score, 100), 0)
+
+        if recent_total < max(2, self.thread_count):
+            node_health_status = "warming"
+            node_degraded_reason = "warming_up"
+        elif health_score < 60 or fail_ratio >= 0.45 or recent_timeout_count >= max(2, self.thread_count):
+            node_health_status = "degraded"
+            if recent_timeout_count >= max(2, self.thread_count):
+                node_degraded_reason = "recent_timeout_spike"
+            elif fail_ratio >= 0.45:
+                node_degraded_reason = "recent_fail_spike"
+            else:
+                node_degraded_reason = "health_score_low"
+        elif cooling_browsers > 0:
+            node_health_status = "cooling"
+            node_degraded_reason = "cooldown_after_failures"
+        elif recovering_browsers > 0:
+            node_health_status = "recovering"
+            node_degraded_reason = "browser_recovering"
+        else:
+            node_health_status = "healthy"
+            node_degraded_reason = ""
+
+        browser_runtime = []
+        for index in range(1, self.thread_count + 1):
+            runtime = self._get_browser_runtime(index)
+            browser_runtime.append({
+                "index": index,
+                "task_count": runtime.get("task_count", 0),
+                "page_reuse_count": runtime.get("page_reuse_count", 0),
+                "consecutive_failures": runtime.get("consecutive_failures", 0),
+                "recovering": runtime.get("recovering_until", 0) > now,
+                "cooling": runtime.get("cooling_until", 0) > now,
+                "force_recycle_page": bool(runtime.get("force_recycle_page")),
+                "last_outcome": runtime.get("last_outcome", ""),
+                "last_message": runtime.get("last_message", ""),
+                "last_success_at": runtime.get("last_success_at", 0.0),
+                "last_failure_at": runtime.get("last_failure_at", 0.0),
+                "restart_count": runtime.get("restart_count", 0),
+            })
+
+        return {
+            "node_health_score": health_score,
+            "node_health_status": node_health_status,
+            "node_degraded_reason": node_degraded_reason,
+            "recent_success_count": recent_success_count,
+            "recent_fail_count": recent_fail_count,
+            "recent_captcha_fail_count": recent_captcha_fail_count,
+            "recent_timeout_count": recent_timeout_count,
+            "avg_solve_seconds_recent": avg_solve_seconds_recent,
+            "recovering_browsers": recovering_browsers,
+            "cooling_browsers": cooling_browsers,
+            "page_recycle_pending": page_recycle_pending,
+            "browser_restart_count_recent": browser_restart_count_recent,
+            "last_success_at": round(last_success_at, 3) if last_success_at else 0.0,
+            "last_failure_at": round(last_failure_at, 3) if last_failure_at else 0.0,
+            "browser_runtime": browser_runtime,
+        }
 
     async def _reserve_solver_slot(self):
         async with self._admission_lock:
@@ -239,16 +419,9 @@ class TurnstileAPIServer:
         logger.info(f"浏览器池就绪，共 {self.browser_pool.qsize()} 个实例")
 
     async def _restart_browser(self, index: int, old_browser, config: dict) -> tuple:
-        """重启单个浏览器实例，释放累积的内存泄漏"""
-        logger.warning(f"浏览器 {index}: 达到 {BROWSER_RESTART_THRESHOLD} 次重启阈值，正在重启...")
-        # 清理该浏览器的持久页面
-        if index in self._persistent_pages:
-            try:
-                ctx, pg = self._persistent_pages.pop(index)
-                await pg.close()
-                await ctx.close()
-            except Exception:
-                pass
+        """重启单个浏览器实例，释放长时间运行后的污染与内存泄漏"""
+        logger.warning(f"浏览器 {index}: 达到换血条件，正在重启...")
+        await self._cleanup_persistent_page(index)
         try:
             await old_browser.close()
         except Exception:
@@ -265,6 +438,15 @@ class TurnstileAPIServer:
                 )
             else:
                 raise RuntimeError("无可用浏览器管理器")
+            runtime = self._get_browser_runtime(index)
+            runtime["task_count"] = 0
+            runtime["page_reuse_count"] = 0
+            runtime["consecutive_failures"] = 0
+            runtime["force_recycle_page"] = False
+            runtime["last_restart_at"] = time.time()
+            runtime["restart_count"] += 1
+            self._restart_events.append(runtime["last_restart_at"])
+            self._mark_browser_recovering(index, RECOVERING_GRACE_SECONDS, "browser_restarted")
             logger.success(f"浏览器 {index}: 重启成功")
             return (index, new_browser, config, 0)
         except Exception as e:
@@ -459,7 +641,7 @@ class TurnstileAPIServer:
     # ========== 核心解题逻辑 ==========
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str):
-        """执行 Turnstile 解题的完整流程（支持页面复用加速）"""
+        """执行 Turnstile 解题的完整流程（受控复用 + 主动换血）"""
         index = None
         browser = None
         bconfig = None
@@ -473,6 +655,8 @@ class TurnstileAPIServer:
             )
             await self._release_solver_slot()
             reserved_slot_released = True
+            runtime = self._get_browser_runtime(index)
+            runtime["task_count"] = max(runtime.get("task_count", 0), task_count)
             self._set_task_state(
                 task_id,
                 "processing",
@@ -501,13 +685,15 @@ class TurnstileAPIServer:
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
             return
 
-        # 检查浏览器连接，断开时自动恢复
+        runtime = self._get_browser_runtime(index)
+
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
                 self._set_task_state(task_id, "processing", "browser_recovering", f"浏览器 #{index} 连接断开，尝试自动恢复", browser_index=index)
                 logger.warning(f"浏览器 {index}: 连接断开，尝试自动恢复...")
                 try:
                     index, browser, bconfig, task_count = await self._restart_browser(index, browser, bconfig)
+                    runtime = self._get_browser_runtime(index)
                     self._set_task_state(task_id, "processing", "browser_recovered", f"浏览器 #{index} 已自动恢复", browser_index=index)
                 except Exception:
                     self._set_task_state(task_id, "failed", "browser_recover_failed", f"浏览器 #{index} 自动恢复失败", browser_index=index)
@@ -516,11 +702,11 @@ class TurnstileAPIServer:
         except Exception:
             pass
 
-        # 检查是否需要定期重启（防止内存泄漏累积）
         if task_count >= BROWSER_RESTART_THRESHOLD:
-            self._set_task_state(task_id, "processing", "browser_restarting", f"浏览器 #{index} 达到重启阈值，准备重启", browser_index=index)
+            self._set_task_state(task_id, "processing", "browser_restarting", f"浏览器 #{index} 达到硬重启阈值，准备重启", browser_index=index)
             try:
                 index, browser, bconfig, task_count = await self._restart_browser(index, browser, bconfig)
+                runtime = self._get_browser_runtime(index)
                 self._set_task_state(task_id, "processing", "browser_restarted", f"浏览器 #{index} 已完成例行重启", browser_index=index)
             except Exception:
                 await self.browser_pool.put((index, browser, bconfig, task_count))
@@ -528,7 +714,14 @@ class TurnstileAPIServer:
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
 
-        # 尝试复用持久页面，避免重复加载（省 3-5s）
+        recycle_reason = self._should_recycle_persistent_page(index, task_count)
+        if recycle_reason and index in self._persistent_pages:
+            if self.debug:
+                logger.debug(f"浏览器 {index}: {recycle_reason}，丢弃旧页面")
+            await self._cleanup_persistent_page(index)
+            runtime["force_recycle_page"] = False
+            runtime["recycle_count"] += 1
+
         is_reuse = False
         context = None
         page = None
@@ -536,24 +729,18 @@ class TurnstileAPIServer:
         if index in self._persistent_pages:
             try:
                 context, page = self._persistent_pages[index]
-                await page.evaluate("1")  # 快速检查页面是否存活
+                await page.evaluate("1")
                 is_reuse = True
                 if self.debug:
                     logger.debug(f"浏览器 {index}: 复用已有页面")
             except Exception:
-                # 页面已失效，清理后重新创建
                 if self.debug:
                     logger.debug(f"浏览器 {index}: 持久页面已失效，重新创建")
-                try:
-                    await page.close()
-                    await context.close()
-                except Exception:
-                    pass
-                del self._persistent_pages[index]
+                await self._cleanup_persistent_page(index)
+                runtime["force_recycle_page"] = False
                 is_reuse = False
 
         if not is_reuse:
-            # 首次或页面失效：创建新的上下文和页面
             ctx_opts = {}
             if bconfig.get('useragent'):
                 ctx_opts["user_agent"] = bconfig['useragent']
@@ -562,14 +749,13 @@ class TurnstileAPIServer:
 
             context = await browser.new_context(**ctx_opts)
             page = await context.new_page()
-
-            # 注入反检测脚本
             await self._antishadow_inject(page)
             await self._block_rendering(page)
             await self._inject_antibot(page)
 
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
                 await page.set_viewport_size({"width": 500, "height": 100})
+            runtime["page_reuse_count"] = 0
 
         start_time = time.time()
 
@@ -580,19 +766,16 @@ class TurnstileAPIServer:
 
             if not is_reuse:
                 self._set_task_state(task_id, "processing", "opening_page", "打开目标页面并准备环境", browser_index=index)
-                # 首次：打开目标页面并加载 Turnstile JS
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 await self._unblock_rendering(page)
             else:
                 self._set_task_state(task_id, "processing", "reusing_page", "复用持久页面继续解题", browser_index=index)
 
             self._set_task_state(task_id, "processing", "injecting_widget", "注入 Turnstile 组件", browser_index=index)
-            # 注入 Turnstile widget（已有 JS 时跳过加载，直接渲染）
             await self._inject_captcha_directly(page, sitekey, index)
-            await asyncio.sleep(1)  # 从 3s 缩短到 1s
+            await asyncio.sleep(1)
 
             self._set_task_state(task_id, "processing", "waiting_token", "等待 Turnstile 返回 token", browser_index=index)
-            # 轮询等待 token（加快轮询间隔）
             locator = page.locator('input[name="cf-turnstile-response"]')
             max_attempts = 30
             click_count = 0
@@ -616,21 +799,27 @@ class TurnstileAPIServer:
                                         f"{COLORS['MAGENTA']}{token[:10]}...{COLORS['RESET']} "
                                         f"耗时 {COLORS['GREEN']}{elapsed}s{COLORS['RESET']}"
                                     )
-                                    # 成功时重置连续失败计数，保留持久页面
+                                    runtime = self._get_browser_runtime(index)
+                                    runtime["consecutive_failures"] = 0
+                                    runtime["recent_failures"] = 0
+                                    runtime["last_success_at"] = time.time()
+                                    runtime["recovering_until"] = 0.0
+                                    runtime["cooling_until"] = 0.0
+                                    runtime["force_recycle_page"] = False
+                                    runtime["page_reuse_count"] = runtime.get("page_reuse_count", 0) + 1
                                     self._consecutive_fails[index] = 0
                                     self._persistent_pages[index] = (context, page)
+                                    self._record_recent_result(index, "success", elapsed, "token_ready")
                                     self._set_task_state(task_id, "completed", "token_ready", "Turnstile token 已就绪", browser_index=index, elapsed_time=elapsed)
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed})
                                     return
                             except Exception:
                                 continue
 
-                    # 更早尝试点击（第 1 次就开始），更频繁点击
                     if attempt % 2 == 0 and click_count < max_clicks:
                         await self._try_click_strategies(page, index)
                         click_count += 1
 
-                    # 加快轮询间隔：0.3s 起步，最大 1.0s
                     wait = min(0.3 + (attempt * 0.03), 1.0)
                     await asyncio.sleep(wait)
 
@@ -644,20 +833,29 @@ class TurnstileAPIServer:
 
             elapsed = round(time.time() - start_time, 3)
             logger.error(f"浏览器 {index}: 解题超时 ({elapsed}s)")
-            # 递增连续失败计数
-            self._consecutive_fails[index] = self._consecutive_fails.get(index, 0) + 1
-            fails = self._consecutive_fails[index]
+            runtime = self._get_browser_runtime(index)
+            runtime["consecutive_failures"] = runtime.get("consecutive_failures", 0) + 1
+            runtime["recent_failures"] = runtime.get("recent_failures", 0) + 1
+            runtime["last_failure_at"] = time.time()
+            runtime["force_recycle_page"] = True
+            self._consecutive_fails[index] = runtime["consecutive_failures"]
+            fails = runtime["consecutive_failures"]
             logger.warning(f"浏览器 {index}: 连续失败 {fails}/{CONSECUTIVE_FAIL_RESTART}")
+            self._record_recent_result(index, "timeout", elapsed, "solve_timeout")
             self._set_task_state(task_id, "failed", "solve_timeout", "等待 Turnstile token 超时", browser_index=index, elapsed_time=elapsed)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed})
 
         except Exception as e:
             elapsed = round(time.time() - start_time, 3)
             logger.error(f"浏览器 {index}: 解题异常: {e}")
-            self._consecutive_fails[index] = self._consecutive_fails.get(index, 0) + 1
-            # 异常时销毁持久页面（可能已损坏）
-            if index in self._persistent_pages:
-                del self._persistent_pages[index]
+            runtime = self._get_browser_runtime(index)
+            runtime["consecutive_failures"] = runtime.get("consecutive_failures", 0) + 1
+            runtime["recent_failures"] = runtime.get("recent_failures", 0) + 1
+            runtime["last_failure_at"] = time.time()
+            runtime["force_recycle_page"] = True
+            self._consecutive_fails[index] = runtime["consecutive_failures"]
+            self._record_recent_result(index, "exception", elapsed, f"solve_exception: {e}")
+            await self._cleanup_persistent_page(index)
             try:
                 await page.close()
                 await context.close()
@@ -667,40 +865,31 @@ class TurnstileAPIServer:
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed})
 
         finally:
-            # 连续失败过多时，强制重启浏览器（绕过 Cloudflare 风控标记）
-            fails = self._consecutive_fails.get(index, 0)
+            runtime = self._get_browser_runtime(index)
+            fails = runtime.get("consecutive_failures", 0)
             if fails >= CONSECUTIVE_FAIL_RESTART:
                 logger.warning(f"浏览器 {index}: 连续失败 {fails} 次，触发强制重启以绕过风控...")
-                # 销毁持久页面
-                if index in self._persistent_pages:
-                    try:
-                        ctx, pg = self._persistent_pages.pop(index)
-                        await pg.close()
-                        await ctx.close()
-                    except Exception:
-                        pass
+                await self._cleanup_persistent_page(index)
                 try:
                     index, browser, bconfig, task_count = await self._restart_browser(index, browser, bconfig)
+                    runtime = self._get_browser_runtime(index)
                     self._consecutive_fails[index] = 0
                     cooldown = random.uniform(*FAIL_COOLDOWN_RANGE)
                     logger.info(f"浏览器 {index}: 重启后冷却 {cooldown:.1f}s...")
+                    self._mark_browser_cooling(index, cooldown, "restart_cooldown")
                     await asyncio.sleep(cooldown)
                 except Exception as e:
                     logger.error(f"浏览器 {index}: 强制重启失败: {e}")
             elif fails > 0:
-                # 失败时销毁持久页面（下次重新创建干净页面）
-                if index in self._persistent_pages:
-                    try:
-                        ctx, pg = self._persistent_pages.pop(index)
-                        await pg.close()
-                        await ctx.close()
-                    except Exception:
-                        pass
+                await self._cleanup_persistent_page(index)
                 cooldown = random.uniform(1, 3)
+                self._mark_browser_cooling(index, cooldown, "failure_cooldown")
                 await asyncio.sleep(cooldown)
 
-            # 归还浏览器，task_count + 1
-            await self.browser_pool.put((index, browser, bconfig, task_count + 1))
+            if browser is not None and index is not None:
+                runtime = self._get_browser_runtime(index)
+                runtime["task_count"] = task_count + 1
+                await self.browser_pool.put((index, browser, bconfig, task_count + 1))
 
     # ========== HTTP 路由处理 ==========
 
@@ -787,13 +976,14 @@ class TurnstileAPIServer:
         })
 
     async def stats(self):
-        """统计端点：返回解题统计和系统状态"""
+        """统计端点：返回解题统计、运行态与节点健康度"""
         db_stats = await get_stats()
         import psutil
         process = psutil.Process()
         mem_mb = round(process.memory_info().rss / 1024 / 1024, 1)
         raw_available = self.browser_pool.qsize()
         effective_available = self._effective_available_browsers()
+        health = self._build_health_snapshot()
         return jsonify({
             **db_stats,
             "available_browsers": effective_available,
@@ -802,13 +992,17 @@ class TurnstileAPIServer:
             "tracked_tasks": len(self._task_states),
             "total_browsers": self.thread_count,
             "memory_mb": mem_mb,
+            "soft_recycle_threshold": BROWSER_SOFT_RECYCLE_THRESHOLD,
             "restart_threshold": BROWSER_RESTART_THRESHOLD,
+            "page_reuse_limit": PAGE_REUSE_LIMIT,
+            **health,
         })
 
     async def index(self):
         """健康检查页面"""
         raw_available = self.browser_pool.qsize()
         effective_available = self._effective_available_browsers()
+        health = self._build_health_snapshot()
         return jsonify({
             "status": "running",
             "browser_type": self.browser_type,
@@ -816,6 +1010,9 @@ class TurnstileAPIServer:
             "raw_available_browsers": raw_available,
             "reserved_slots": self._reserved_slots,
             "total_browsers": self.thread_count,
+            "node_health_status": health["node_health_status"],
+            "node_health_score": health["node_health_score"],
+            "node_degraded_reason": health["node_degraded_reason"],
             "usage": "GET /turnstile?url=<url>&sitekey=<sitekey>",
         })
 
