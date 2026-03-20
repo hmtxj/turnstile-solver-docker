@@ -73,6 +73,8 @@ BROWSER_RESTART_THRESHOLD = 25
 CONSECUTIVE_FAIL_RESTART = 3
 # 失败后冷却等待范围（秒），避免被风控快速标记
 FAIL_COOLDOWN_RANGE = (3, 8)
+# 获取浏览器的最长等待时间（秒），避免任务无限排队
+BROWSER_ACQUIRE_TIMEOUT = 10
 
 
 class TurnstileAPIServer:
@@ -93,6 +95,9 @@ class TurnstileAPIServer:
         # 持久页面缓存 {index: (context, page)}，避免每次重新加载
         self._persistent_pages = {}
         self.console = Console()
+        self._task_states = {}
+        self._admission_lock = asyncio.Lock()
+        self._reserved_slots = 0
         self._setup_routes()
 
     def display_welcome(self):
@@ -125,6 +130,58 @@ class TurnstileAPIServer:
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/stats', methods=['GET'])(self.stats)
         self.app.route('/')(self.index)
+
+    def _effective_available_browsers(self) -> int:
+        return max(self.browser_pool.qsize() - self._reserved_slots, 0)
+
+    def _set_task_state(self, task_id: str, status: str, stage: str, message: str = "", **extra):
+        now = time.time()
+        state = self._task_states.get(task_id, {})
+        created_at = state.get("created_at", now)
+        state.update({
+            "task_id": task_id,
+            "status": status,
+            "stage": stage,
+            "message": message,
+            "created_at": created_at,
+            "updated_at": now,
+            "solution": None,
+        })
+        for key, value in extra.items():
+            if value is not None:
+                state[key] = value
+        if extra.get("elapsed_time") is None:
+            state["elapsed_time"] = round(max(now - created_at, 0), 3)
+        self._task_states[task_id] = state
+
+    def _build_task_state_payload(self, task_id: str):
+        state = self._task_states.get(task_id)
+        if not state:
+            return None
+        payload = dict(state)
+        created_at = payload.get("created_at")
+        if created_at and payload.get("status") not in {"completed", "failed"}:
+            payload["elapsed_time"] = round(max(time.time() - created_at, 0), 3)
+        payload.setdefault("solution", None)
+        return payload
+
+    async def _reserve_solver_slot(self):
+        async with self._admission_lock:
+            raw_available = self.browser_pool.qsize()
+            effective_available = max(raw_available - self._reserved_slots, 0)
+            if effective_available <= 0:
+                return None
+            self._reserved_slots += 1
+            return {
+                "raw_available_browsers": raw_available,
+                "available_browsers": max(raw_available - self._reserved_slots, 0),
+                "reserved_slots": self._reserved_slots,
+            }
+
+    async def _release_solver_slot(self):
+        async with self._admission_lock:
+            if self._reserved_slots > 0:
+                self._reserved_slots -= 1
 
     async def _startup(self):
         """服务启动时初始化浏览器池"""
@@ -403,15 +460,57 @@ class TurnstileAPIServer:
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str):
         """执行 Turnstile 解题的完整流程（支持页面复用加速）"""
-        index, browser, bconfig, task_count = await self.browser_pool.get()
+        index = None
+        browser = None
+        bconfig = None
+        task_count = 0
+        reserved_slot_released = False
+
+        self._set_task_state(task_id, "queued", "waiting_browser", "等待浏览器分配")
+        try:
+            index, browser, bconfig, task_count = await asyncio.wait_for(
+                self.browser_pool.get(), timeout=BROWSER_ACQUIRE_TIMEOUT
+            )
+            await self._release_solver_slot()
+            reserved_slot_released = True
+            self._set_task_state(
+                task_id,
+                "processing",
+                "browser_acquired",
+                f"已分配浏览器 #{index}",
+                browser_index=index,
+            )
+        except asyncio.TimeoutError:
+            if not reserved_slot_released:
+                await self._release_solver_slot()
+            logger.error(f"任务 {task_id[:8]}: {BROWSER_ACQUIRE_TIMEOUT}s 内未分配到浏览器")
+            self._set_task_state(
+                task_id,
+                "failed",
+                "browser_acquire_timeout",
+                f"{BROWSER_ACQUIRE_TIMEOUT}s 内未分配到浏览器",
+                elapsed_time=BROWSER_ACQUIRE_TIMEOUT,
+            )
+            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": BROWSER_ACQUIRE_TIMEOUT})
+            return
+        except Exception as e:
+            if not reserved_slot_released:
+                await self._release_solver_slot()
+            logger.error(f"任务 {task_id[:8]}: 获取浏览器失败: {e}")
+            self._set_task_state(task_id, "failed", "browser_acquire_error", f"获取浏览器失败: {e}")
+            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
+            return
 
         # 检查浏览器连接，断开时自动恢复
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
+                self._set_task_state(task_id, "processing", "browser_recovering", f"浏览器 #{index} 连接断开，尝试自动恢复", browser_index=index)
                 logger.warning(f"浏览器 {index}: 连接断开，尝试自动恢复...")
                 try:
                     index, browser, bconfig, task_count = await self._restart_browser(index, browser, bconfig)
+                    self._set_task_state(task_id, "processing", "browser_recovered", f"浏览器 #{index} 已自动恢复", browser_index=index)
                 except Exception:
+                    self._set_task_state(task_id, "failed", "browser_recover_failed", f"浏览器 #{index} 自动恢复失败", browser_index=index)
                     await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                     return
         except Exception:
@@ -419,10 +518,13 @@ class TurnstileAPIServer:
 
         # 检查是否需要定期重启（防止内存泄漏累积）
         if task_count >= BROWSER_RESTART_THRESHOLD:
+            self._set_task_state(task_id, "processing", "browser_restarting", f"浏览器 #{index} 达到重启阈值，准备重启", browser_index=index)
             try:
                 index, browser, bconfig, task_count = await self._restart_browser(index, browser, bconfig)
+                self._set_task_state(task_id, "processing", "browser_restarted", f"浏览器 #{index} 已完成例行重启", browser_index=index)
             except Exception:
                 await self.browser_pool.put((index, browser, bconfig, task_count))
+                self._set_task_state(task_id, "failed", "browser_restart_failed", f"浏览器 #{index} 例行重启失败", browser_index=index)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
 
@@ -477,14 +579,19 @@ class TurnstileAPIServer:
                 logger.debug(f"浏览器 {index}: 开始解题 [{reuse_tag}] (第 {task_count + 1} 次)")
 
             if not is_reuse:
+                self._set_task_state(task_id, "processing", "opening_page", "打开目标页面并准备环境", browser_index=index)
                 # 首次：打开目标页面并加载 Turnstile JS
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 await self._unblock_rendering(page)
+            else:
+                self._set_task_state(task_id, "processing", "reusing_page", "复用持久页面继续解题", browser_index=index)
 
+            self._set_task_state(task_id, "processing", "injecting_widget", "注入 Turnstile 组件", browser_index=index)
             # 注入 Turnstile widget（已有 JS 时跳过加载，直接渲染）
             await self._inject_captcha_directly(page, sitekey, index)
             await asyncio.sleep(1)  # 从 3s 缩短到 1s
 
+            self._set_task_state(task_id, "processing", "waiting_token", "等待 Turnstile 返回 token", browser_index=index)
             # 轮询等待 token（加快轮询间隔）
             locator = page.locator('input[name="cf-turnstile-response"]')
             max_attempts = 30
@@ -512,6 +619,7 @@ class TurnstileAPIServer:
                                     # 成功时重置连续失败计数，保留持久页面
                                     self._consecutive_fails[index] = 0
                                     self._persistent_pages[index] = (context, page)
+                                    self._set_task_state(task_id, "completed", "token_ready", "Turnstile token 已就绪", browser_index=index, elapsed_time=elapsed)
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed})
                                     return
                             except Exception:
@@ -540,6 +648,7 @@ class TurnstileAPIServer:
             self._consecutive_fails[index] = self._consecutive_fails.get(index, 0) + 1
             fails = self._consecutive_fails[index]
             logger.warning(f"浏览器 {index}: 连续失败 {fails}/{CONSECUTIVE_FAIL_RESTART}")
+            self._set_task_state(task_id, "failed", "solve_timeout", "等待 Turnstile token 超时", browser_index=index, elapsed_time=elapsed)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed})
 
         except Exception as e:
@@ -554,6 +663,7 @@ class TurnstileAPIServer:
                 await context.close()
             except Exception:
                 pass
+            self._set_task_state(task_id, "failed", "solve_exception", f"解题异常: {e}", browser_index=index, elapsed_time=elapsed)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed})
 
         finally:
@@ -602,13 +712,35 @@ class TurnstileAPIServer:
         if not url or not sitekey:
             return jsonify({"error": "缺少 url 或 sitekey 参数"}), 400
 
+        reservation = await self._reserve_solver_slot()
+        if not reservation:
+            raw_available = self.browser_pool.qsize()
+            effective_available = self._effective_available_browsers()
+            logger.warning(f"忙碌拒单: raw_available={raw_available}, reserved={self._reserved_slots}, total={self.thread_count}")
+            return jsonify({
+                "status": "busy",
+                "error": "solver_busy",
+                "message": "当前无空闲浏览器，请稍后重试",
+                "available_browsers": effective_available,
+                "raw_available_browsers": raw_available,
+                "reserved_slots": self._reserved_slots,
+                "total_browsers": self.thread_count,
+            }), 503
+
         task_id = str(uuid.uuid4())
+        self._set_task_state(task_id, "queued", "accepted", "任务已创建，等待浏览器分配", url=url)
         logger.info(f"新任务: {task_id[:8]}... URL={url} sitekey={sitekey[:10]}...")
 
         # 异步启动解题
         asyncio.create_task(self._solve_turnstile(task_id, url, sitekey))
 
-        return jsonify({"task_id": task_id, "status": "processing"})
+        return jsonify({
+            "task_id": task_id,
+            "status": "queued",
+            "stage": "accepted",
+            "message": "任务已创建，等待浏览器分配",
+            **reservation,
+        })
 
     async def get_result(self):
         """处理 /result 请求，返回解题结果（取走后自动删除释放内存）"""
@@ -618,11 +750,18 @@ class TurnstileAPIServer:
 
         result = await load_result(task_id)
         if not result:
+            payload = self._build_task_state_payload(task_id)
+            if payload:
+                return jsonify(payload)
             return jsonify({
                 "task_id": task_id,
                 "status": "CAPTCHA_NOT_READY",
+                "stage": "unknown",
+                "message": "任务不存在或结果尚未回写",
                 "solution": None,
             })
+
+        task_state = self._task_states.pop(task_id, None)
 
         # 结果已就绪，取走后立即删除释放内存
         await delete_result(task_id)
@@ -632,15 +771,19 @@ class TurnstileAPIServer:
             return jsonify({
                 "task_id": task_id,
                 "status": "failed",
+                "stage": (task_state or {}).get("stage", "failed"),
+                "message": (task_state or {}).get("message", "解题失败"),
                 "solution": {"token": "CAPTCHA_FAIL"},
-                "elapsed_time": result.get("elapsed_time", 0),
+                "elapsed_time": result.get("elapsed_time", (task_state or {}).get("elapsed_time", 0)),
             })
 
         return jsonify({
             "task_id": task_id,
             "status": "completed",
+            "stage": (task_state or {}).get("stage", "completed"),
+            "message": (task_state or {}).get("message", "Turnstile token 已就绪"),
             "solution": {"token": token},
-            "elapsed_time": result.get("elapsed_time", 0),
+            "elapsed_time": result.get("elapsed_time", (task_state or {}).get("elapsed_time", 0)),
         })
 
     async def stats(self):
@@ -649,9 +792,14 @@ class TurnstileAPIServer:
         import psutil
         process = psutil.Process()
         mem_mb = round(process.memory_info().rss / 1024 / 1024, 1)
+        raw_available = self.browser_pool.qsize()
+        effective_available = self._effective_available_browsers()
         return jsonify({
             **db_stats,
-            "available_browsers": self.browser_pool.qsize(),
+            "available_browsers": effective_available,
+            "raw_available_browsers": raw_available,
+            "reserved_slots": self._reserved_slots,
+            "tracked_tasks": len(self._task_states),
             "total_browsers": self.thread_count,
             "memory_mb": mem_mb,
             "restart_threshold": BROWSER_RESTART_THRESHOLD,
@@ -659,11 +807,14 @@ class TurnstileAPIServer:
 
     async def index(self):
         """健康检查页面"""
-        pool_size = self.browser_pool.qsize()
+        raw_available = self.browser_pool.qsize()
+        effective_available = self._effective_available_browsers()
         return jsonify({
             "status": "running",
             "browser_type": self.browser_type,
-            "available_browsers": pool_size,
+            "available_browsers": effective_available,
+            "raw_available_browsers": raw_available,
+            "reserved_slots": self._reserved_slots,
             "total_browsers": self.thread_count,
             "usage": "GET /turnstile?url=<url>&sitekey=<sitekey>",
         })
