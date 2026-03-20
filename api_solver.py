@@ -18,7 +18,8 @@ import uuid
 import random
 import logging
 import asyncio
-from typing import Optional
+import secrets
+from typing import Any, Optional
 from collections import deque
 import argparse
 from quart import Quart, request, jsonify
@@ -88,6 +89,20 @@ RESTART_EVENT_WINDOW_SECONDS = 900
 BROWSER_ACQUIRE_TIMEOUT = 10
 
 
+def _read_env_float(name: str, default: float) -> float:
+    raw = str(os.getenv(name, "")).strip()
+    try:
+        return float(raw) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+DEFAULT_NODE_ID = os.getenv("SOLVER_NODE_ID", "").strip()
+DEFAULT_NODE_LABEL = os.getenv("SOLVER_NODE_LABEL", os.getenv("HOSTNAME", "")).strip()
+SOLVER_ADMIN_TOKEN = os.getenv("SOLVER_ADMIN_TOKEN", "").strip()
+SOLVER_REINIT_COOLDOWN_SECONDS = max(_read_env_float("SOLVER_REINIT_COOLDOWN_SECONDS", 45.0), 1.0)
+
+
 class TurnstileAPIServer:
 
     def __init__(self, headless: bool, debug: bool, browser_type: str, thread: int):
@@ -96,6 +111,12 @@ class TurnstileAPIServer:
         self.browser_type = browser_type
         self.headless = headless
         self.thread_count = thread
+        self.node_id = DEFAULT_NODE_ID or f"solver-{uuid.uuid4().hex[:8]}"
+        self.node_label = DEFAULT_NODE_LABEL or self.node_id
+        self.boot_id = uuid.uuid4().hex
+        self.started_at = round(time.time(), 3)
+        self._admin_token = SOLVER_ADMIN_TOKEN
+        self.reinit_cooldown_seconds = SOLVER_REINIT_COOLDOWN_SECONDS
         # 浏览器池元素格式: (index, browser, config, task_count)
         self.browser_pool = asyncio.Queue()
         # 保存 Camoufox 管理器引用，用于创建新浏览器
@@ -113,6 +134,20 @@ class TurnstileAPIServer:
         self._task_states = {}
         self._admission_lock = asyncio.Lock()
         self._reserved_slots = 0
+        self._reinit_lock = asyncio.Lock()
+        self.init_count = 0
+        self.last_init_at = 0.0
+        self.last_init_reason = ""
+        self.last_init_result = ""
+        self.last_reinit_requested_by = ""
+        self.last_reinit_source = ""
+        self.last_reinit_request_at = 0.0
+        self.last_reinit_finished_at = 0.0
+        self.last_reinit_error = ""
+        self.last_reinit_status = ""
+        self.last_reinit_message = ""
+        self.reinit_in_progress = False
+        self.reinit_cooldown_until = 0.0
         self._setup_routes()
 
     def display_welcome(self):
@@ -120,6 +155,10 @@ class TurnstileAPIServer:
         self.console.clear()
         text = Text()
         text.append("\n🔧 Turnstile Solver 服务", style="bold white")
+        text.append(f"\n🆔 节点编号: ", style="bold white")
+        text.append(f"{self.node_id}", style="green")
+        text.append(f"\n🏷️ 节点标签: ", style="bold white")
+        text.append(f"{self.node_label}", style="cyan")
         text.append(f"\n🧵 浏览器线程: ", style="bold white")
         text.append(f"{self.thread_count}", style="green")
         text.append(f"\n🌐 浏览器类型: ", style="bold white")
@@ -144,10 +183,196 @@ class TurnstileAPIServer:
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/stats', methods=['GET'])(self.stats)
+        self.app.route('/admin/reinitialize', methods=['POST'])(self.admin_reinitialize)
         self.app.route('/')(self.index)
 
     def _effective_available_browsers(self) -> int:
         return max(self.browser_pool.qsize() - self._reserved_slots, 0)
+
+    def _reinit_cooldown_remaining(self) -> float:
+        return max(self.reinit_cooldown_until - time.time(), 0.0)
+
+    def _build_node_runtime_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        return {
+            "node_id": self.node_id,
+            "node_label": self.node_label,
+            "boot_id": self.boot_id,
+            "started_at": self.started_at,
+            "uptime_seconds": round(max(now - self.started_at, 0.0), 3),
+            "init_count": self.init_count,
+            "last_init_at": round(self.last_init_at, 3) if self.last_init_at else 0.0,
+            "last_init_reason": self.last_init_reason,
+            "last_init_result": self.last_init_result,
+            "last_reinit_requested_by": self.last_reinit_requested_by,
+            "last_reinit_source": self.last_reinit_source,
+            "last_reinit_request_at": round(self.last_reinit_request_at, 3) if self.last_reinit_request_at else 0.0,
+            "last_reinit_finished_at": round(self.last_reinit_finished_at, 3) if self.last_reinit_finished_at else 0.0,
+            "last_reinit_error": self.last_reinit_error,
+            "last_reinit_status": self.last_reinit_status,
+            "last_reinit_message": self.last_reinit_message,
+            "reinit_in_progress": self.reinit_in_progress,
+            "reinit_cooldown_until": round(self.reinit_cooldown_until, 3) if self.reinit_cooldown_until else 0.0,
+            "reinit_cooldown_remaining": round(self._reinit_cooldown_remaining(), 3),
+            "reinit_supported": bool(self._admin_token),
+        }
+
+    def _extract_admin_token(self) -> str:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            return auth_header.split(" ", 1)[1].strip()
+        return str(request.headers.get("X-Solver-Admin-Token", "")).strip()
+
+    def _is_admin_authorized(self) -> bool:
+        token = self._extract_admin_token()
+        if not self._admin_token or not token:
+            return False
+        return secrets.compare_digest(token, self._admin_token)
+
+    async def _close_browser_instance(self, browser):
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    async def _drain_idle_browser_pool(self) -> list[int]:
+        drained_indexes: list[int] = []
+        while True:
+            try:
+                index, browser, _config, _task_count = self.browser_pool.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            await self._cleanup_persistent_page(index)
+            await self._close_browser_instance(browser)
+            drained_indexes.append(index)
+        return drained_indexes
+
+    async def _reset_solver_runtime(self):
+        for index in list(self._persistent_pages.keys()):
+            await self._cleanup_persistent_page(index)
+        self._persistent_pages.clear()
+        self._recent_results.clear()
+        self._restart_events.clear()
+        self._consecutive_fails.clear()
+        self._browser_runtime = {}
+        async with self._admission_lock:
+            self._reserved_slots = 0
+
+    async def _create_browser_entry(self, index: int) -> tuple:
+        if self.browser_type == "camoufox":
+            if self._camoufox_manager is None:
+                self._camoufox_manager = AsyncCamoufox(headless=self.headless)
+            browser = await self._camoufox_manager.start()
+            config = {
+                'browser_name': 'camoufox',
+                'browser_version': 'latest',
+                'useragent': None,
+                'sec_ch_ua': None,
+            }
+        else:
+            if self._pw_manager is None:
+                from patchright.async_api import async_playwright
+                self._pw_manager = await async_playwright().start()
+            _, ver, ua, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+            browser = await self._pw_manager.chromium.launch(
+                channel=self.browser_type,
+                headless=self.headless,
+                args=["--window-position=0,0", "--force-device-scale-factor=1", f"--user-agent={ua}"]
+            )
+            config = {
+                'browser_name': 'chrome',
+                'browser_version': ver,
+                'useragent': ua,
+                'sec_ch_ua': sec_ch_ua,
+            }
+        runtime = self._get_browser_runtime(index)
+        runtime["task_count"] = 0
+        return (index, browser, config, 0)
+
+    async def _reinitialize_solver(self, reason: str, requested_by: str, source: str) -> dict[str, Any]:
+        async with self._reinit_lock:
+            if self.reinit_in_progress:
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "message": "reinitialize_already_running",
+                    **self._build_node_runtime_snapshot(),
+                }
+
+            cooldown_remaining = self._reinit_cooldown_remaining()
+            if cooldown_remaining > 0:
+                self.last_reinit_status = "cooldown"
+                self.last_reinit_message = "reinitialize_cooldown"
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "message": "reinitialize_cooldown",
+                    "cooldown_remaining": round(cooldown_remaining, 3),
+                    **self._build_node_runtime_snapshot(),
+                }
+
+            self.reinit_in_progress = True
+            self.last_reinit_requested_by = requested_by
+            self.last_reinit_source = source
+            self.last_reinit_request_at = time.time()
+            self.last_reinit_finished_at = 0.0
+            self.last_reinit_error = ""
+            self.last_reinit_status = "running"
+            self.last_reinit_message = reason or "remote_reinitialize"
+            self.last_init_reason = reason or "remote_reinitialize"
+            self.last_init_result = "running"
+            logger.warning(f"节点 {self.node_id}: 收到远程软初始化请求，原因={reason or 'remote_reinitialize'}，来源={requested_by or 'unknown'}")
+
+            try:
+                drained_indexes = await self._drain_idle_browser_pool()
+                if not drained_indexes:
+                    self.reinit_in_progress = False
+                    self.last_reinit_finished_at = time.time()
+                    self.last_reinit_status = "skipped"
+                    self.last_reinit_message = "no_idle_browsers_to_reinitialize"
+                    self.last_init_result = "skipped"
+                    return {
+                        "ok": False,
+                        "accepted": False,
+                        "message": "no_idle_browsers_to_reinitialize",
+                        **self._build_node_runtime_snapshot(),
+                    }
+
+                await self._reset_solver_runtime()
+                await self._initialize_browser(indices=drained_indexes)
+                self.init_count += 1
+                self.last_init_at = time.time()
+                self.last_init_result = "success"
+                self.last_reinit_finished_at = self.last_init_at
+                self.last_reinit_status = "success"
+                self.last_reinit_message = f"reinitialized_{len(drained_indexes)}_browsers"
+                self.reinit_cooldown_until = time.time() + self.reinit_cooldown_seconds
+                logger.success(f"节点 {self.node_id}: 软初始化成功，重建 {len(drained_indexes)} 个空闲浏览器实例")
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "message": self.last_reinit_message,
+                    "reinitialized_browsers": len(drained_indexes),
+                    **self._build_node_runtime_snapshot(),
+                }
+            except Exception as e:
+                self.last_reinit_error = str(e)
+                self.last_reinit_finished_at = time.time()
+                self.last_reinit_status = "failed"
+                self.last_reinit_message = "reinitialize_failed"
+                self.last_init_at = self.last_reinit_finished_at
+                self.last_init_result = "failed"
+                self.reinit_cooldown_until = time.time() + self.reinit_cooldown_seconds
+                logger.error(f"节点 {self.node_id}: 软初始化失败: {e}")
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "message": "reinitialize_failed",
+                    "error": str(e),
+                    **self._build_node_runtime_snapshot(),
+                }
+            finally:
+                self.reinit_in_progress = False
 
     def _set_task_state(self, task_id: str, status: str, stage: str, message: str = "", **extra):
         now = time.time()
@@ -370,74 +595,39 @@ class TurnstileAPIServer:
         try:
             await init_db()
             await self._initialize_browser()
+            self.init_count += 1
+            self.last_init_at = time.time()
+            self.last_init_reason = "startup"
+            self.last_init_result = "success"
             asyncio.create_task(self._periodic_cleanup())
         except Exception as e:
+            self.last_init_at = time.time()
+            self.last_init_reason = "startup"
+            self.last_init_result = "failed"
+            self.last_reinit_error = str(e)
             logger.error(f"浏览器初始化失败: {e}")
             raise
 
-    async def _initialize_browser(self):
+    async def _initialize_browser(self, indices: list[int] | None = None):
         """创建浏览器池（并发初始化，大幅缩短启动时间）"""
-        if self.browser_type == "camoufox":
-            self._camoufox_manager = AsyncCamoufox(headless=self.headless)
+        target_indices = [int(i) for i in (indices or list(range(1, self.thread_count + 1)))]
 
-            async def _start_camoufox(i):
-                browser = await self._camoufox_manager.start()
-                config = {
-                    'browser_name': 'camoufox',
-                    'browser_version': 'latest',
-                    'useragent': None,
-                    'sec_ch_ua': None,
-                }
-                await self.browser_pool.put((i + 1, browser, config, 0))
-                if self.debug:
-                    logger.info(f"浏览器 {i + 1} 并发初始化成功")
+        async def _bootstrap(index: int):
+            entry = await self._create_browser_entry(index)
+            await self.browser_pool.put(entry)
+            if self.debug:
+                logger.info(f"浏览器 {index} 并发初始化成功")
 
-            # 并发启动所有浏览器，总耗时 ≈ 单个浏览器耗时
-            await asyncio.gather(*[_start_camoufox(i) for i in range(self.thread_count)])
-        else:
-            from patchright.async_api import async_playwright
-            self._pw_manager = await async_playwright().start()
-
-            async def _start_chromium(i):
-                _, ver, ua, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                browser = await self._pw_manager.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=["--window-position=0,0", "--force-device-scale-factor=1", f"--user-agent={ua}"]
-                )
-                config = {
-                    'browser_name': 'chrome', 'browser_version': ver,
-                    'useragent': ua, 'sec_ch_ua': sec_ch_ua,
-                }
-                await self.browser_pool.put((i + 1, browser, config, 0))
-                if self.debug:
-                    logger.info(f"浏览器 {i + 1} 并发初始化成功 (Chrome {ver})")
-
-            # 并发启动所有浏览器
-            await asyncio.gather(*[_start_chromium(i) for i in range(self.thread_count)])
-
+        await asyncio.gather(*[_bootstrap(index) for index in target_indices])
         logger.info(f"浏览器池就绪，共 {self.browser_pool.qsize()} 个实例")
 
     async def _restart_browser(self, index: int, old_browser, config: dict) -> tuple:
         """重启单个浏览器实例，释放长时间运行后的污染与内存泄漏"""
         logger.warning(f"浏览器 {index}: 达到换血条件，正在重启...")
         await self._cleanup_persistent_page(index)
+        await self._close_browser_instance(old_browser)
         try:
-            await old_browser.close()
-        except Exception:
-            pass
-        try:
-            if self.browser_type == "camoufox" and self._camoufox_manager:
-                new_browser = await self._camoufox_manager.start()
-            elif self._pw_manager:
-                ua = config.get('useragent', '')
-                new_browser = await self._pw_manager.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=["--window-position=0,0", "--force-device-scale-factor=1", f"--user-agent={ua}"]
-                )
-            else:
-                raise RuntimeError("无可用浏览器管理器")
+            index, new_browser, new_config, _ = await self._create_browser_entry(index)
             runtime = self._get_browser_runtime(index)
             runtime["task_count"] = 0
             runtime["page_reuse_count"] = 0
@@ -448,7 +638,7 @@ class TurnstileAPIServer:
             self._restart_events.append(runtime["last_restart_at"])
             self._mark_browser_recovering(index, RECOVERING_GRACE_SECONDS, "browser_restarted")
             logger.success(f"浏览器 {index}: 重启成功")
-            return (index, new_browser, config, 0)
+            return (index, new_browser, new_config, 0)
         except Exception as e:
             logger.error(f"浏览器 {index}: 重启失败: {e}")
             raise
@@ -893,6 +1083,35 @@ class TurnstileAPIServer:
 
     # ========== HTTP 路由处理 ==========
 
+    async def admin_reinitialize(self):
+        """管理接口：执行节点级软初始化"""
+        if not self._admin_token:
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "reinitialize_disabled",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
+        if not self._is_admin_authorized():
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "unauthorized",
+            }), 401
+
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        reason = str(payload.get("reason") or "remote_reinitialize").strip()[:120]
+        requested_by = str(payload.get("requested_by") or "unknown").strip()[:120]
+        source = str(payload.get("source") or "remote_admin").strip()[:120]
+        result = await self._reinitialize_solver(reason=reason, requested_by=requested_by, source=source)
+        status_code = 200 if result.get("ok") else (202 if result.get("message") == "reinitialize_already_running" else 409)
+        if result.get("message") == "reinitialize_disabled":
+            status_code = 503
+        return jsonify(result), status_code
+
     async def process_turnstile(self):
         """处理 /turnstile 请求，创建解题任务"""
         url = request.args.get('url')
@@ -900,6 +1119,15 @@ class TurnstileAPIServer:
 
         if not url or not sitekey:
             return jsonify({"error": "缺少 url 或 sitekey 参数"}), 400
+
+        if self.reinit_in_progress:
+            return jsonify({
+                "status": "busy",
+                "stage": "reinitializing",
+                "error": "solver_reinitializing",
+                "message": "节点正在执行软初始化，请稍后重试",
+                **self._build_node_runtime_snapshot(),
+            }), 503
 
         reservation = await self._reserve_solver_slot()
         if not reservation:
@@ -996,6 +1224,7 @@ class TurnstileAPIServer:
             "restart_threshold": BROWSER_RESTART_THRESHOLD,
             "page_reuse_limit": PAGE_REUSE_LIMIT,
             **health,
+            **self._build_node_runtime_snapshot(),
         })
 
     async def index(self):
@@ -1004,7 +1233,7 @@ class TurnstileAPIServer:
         effective_available = self._effective_available_browsers()
         health = self._build_health_snapshot()
         return jsonify({
-            "status": "running",
+            "status": "reinitializing" if self.reinit_in_progress else "running",
             "browser_type": self.browser_type,
             "available_browsers": effective_available,
             "raw_available_browsers": raw_available,
@@ -1014,6 +1243,7 @@ class TurnstileAPIServer:
             "node_health_score": health["node_health_score"],
             "node_degraded_reason": health["node_degraded_reason"],
             "usage": "GET /turnstile?url=<url>&sitekey=<sitekey>",
+            **self._build_node_runtime_snapshot(),
         })
 
     def run(self, port: int = 5000):
