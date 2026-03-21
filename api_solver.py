@@ -97,10 +97,22 @@ def _read_env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _read_env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
 DEFAULT_NODE_ID = os.getenv("SOLVER_NODE_ID", "").strip()
 DEFAULT_NODE_LABEL = os.getenv("SOLVER_NODE_LABEL", os.getenv("HOSTNAME", "")).strip()
 SOLVER_ADMIN_TOKEN = os.getenv("SOLVER_ADMIN_TOKEN", "").strip()
 SOLVER_REINIT_COOLDOWN_SECONDS = max(_read_env_float("SOLVER_REINIT_COOLDOWN_SECONDS", 45.0), 1.0)
+SOLVER_IDLE_SOFT_RECYCLE_SECONDS = max(_read_env_float("SOLVER_IDLE_SOFT_RECYCLE_SECONDS", 300.0), 0.0)
+SOLVER_IDLE_STANDBY_SECONDS = max(_read_env_float("SOLVER_IDLE_STANDBY_SECONDS", 900.0), 0.0)
+SOLVER_LEASE_TTL_SECONDS = max(_read_env_float("SOLVER_LEASE_TTL_SECONDS", 90.0), 5.0)
+SOLVER_IDLE_SCAN_INTERVAL_SECONDS = max(_read_env_float("SOLVER_IDLE_SCAN_INTERVAL_SECONDS", 15.0), 5.0)
+SOLVER_STANDBY_AUTO_RESUME = _read_env_bool("SOLVER_STANDBY_AUTO_RESUME", True)
 
 
 class TurnstileAPIServer:
@@ -133,6 +145,7 @@ class TurnstileAPIServer:
         self.console = Console()
         self._task_states = {}
         self._admission_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._reserved_slots = 0
         self._reinit_lock = asyncio.Lock()
         self.init_count = 0
@@ -154,6 +167,33 @@ class TurnstileAPIServer:
         self.last_reinit_drained_indexes: list[int] = []
         self.reinit_in_progress = False
         self.reinit_cooldown_until = 0.0
+        self.lifecycle_state = "active"
+        self.drain_requested_at = 0.0
+        self.drain_started_at = 0.0
+        self.drain_finished_at = 0.0
+        self.standby_entered_at = 0.0
+        self.last_task_received_at = 0.0
+        self.last_task_finished_at = 0.0
+        self.idle_since = 0.0
+        self.idle_seconds = 0.0
+        self.accepting_new_tasks = True
+        self.standby_reason = ""
+        self.idle_soft_recycle_seconds = SOLVER_IDLE_SOFT_RECYCLE_SECONDS
+        self.idle_standby_seconds = SOLVER_IDLE_STANDBY_SECONDS
+        self.lease_ttl_seconds = SOLVER_LEASE_TTL_SECONDS
+        self.idle_scan_interval_seconds = SOLVER_IDLE_SCAN_INTERVAL_SECONDS
+        self.standby_auto_resume = SOLVER_STANDBY_AUTO_RESUME
+        self.last_lease_at = 0.0
+        self.lease_expires_at = self.started_at + self.lease_ttl_seconds
+        self.lease_owner = ""
+        self.pending_drain_reason = ""
+        self.idle_soft_recycle_count = 0
+        self.idle_standby_count = 0
+        self.manual_drain_count = 0
+        self.lease_expired_standby_count = 0
+        self._pending_drain_enter_standby = True
+        self._pending_force_reinitialize_when_idle = False
+        self._last_idle_soft_cleanup_at = 0.0
         self._setup_routes()
 
     def display_welcome(self):
@@ -190,6 +230,9 @@ class TurnstileAPIServer:
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/stats', methods=['GET'])(self.stats)
         self.app.route('/admin/reinitialize', methods=['POST'])(self.admin_reinitialize)
+        self.app.route('/admin/drain', methods=['POST'])(self.admin_drain)
+        self.app.route('/admin/resume', methods=['POST'])(self.admin_resume)
+        self.app.route('/admin/lease', methods=['POST'])(self.admin_lease)
         self.app.route('/')(self.index)
 
     def _effective_available_browsers(self) -> int:
@@ -198,14 +241,85 @@ class TurnstileAPIServer:
     def _reinit_cooldown_remaining(self) -> float:
         return max(self.reinit_cooldown_until - time.time(), 0.0)
 
+    def _current_lifecycle_state(self) -> str:
+        if self.reinit_in_progress:
+            return "reinitializing"
+        state = str(self.lifecycle_state or "active").strip().lower()
+        if state not in {"active", "draining", "standby", "reinitializing"}:
+            state = "active"
+        return state
+
+    def _lease_expired(self, now: float | None = None) -> bool:
+        current = float(now if now is not None else time.time())
+        return bool(self.lease_expires_at and current >= self.lease_expires_at)
+
+    def _refresh_idle_state(self, now: float | None = None) -> dict[str, Any]:
+        current = float(now if now is not None else time.time())
+        active_task_count = self._active_task_count()
+        reserved_slots = self._reserved_slots
+        if active_task_count <= 0 and reserved_slots <= 0:
+            if self.idle_since <= 0:
+                baseline = max(
+                    float(self.last_task_finished_at or 0.0),
+                    float(self.last_task_received_at or 0.0),
+                    float(self.started_at or 0.0),
+                )
+                self.idle_since = baseline if baseline > 0 else current
+        else:
+            self.idle_since = 0.0
+            self.idle_seconds = 0.0
+            return {
+                "active_task_count": active_task_count,
+                "reserved_slots": reserved_slots,
+                "idle_seconds": 0.0,
+            }
+        self.idle_seconds = round(max(current - self.idle_since, 0.0), 3) if self.idle_since else 0.0
+        return {
+            "active_task_count": active_task_count,
+            "reserved_slots": reserved_slots,
+            "idle_seconds": self.idle_seconds,
+        }
+
     def _build_node_runtime_snapshot(self) -> dict[str, Any]:
         now = time.time()
+        idle_state = self._refresh_idle_state(now)
+        active_task_count = int(idle_state.get("active_task_count") or 0)
+        reserved_slots = int(idle_state.get("reserved_slots") or 0)
+        idle_seconds = float(idle_state.get("idle_seconds") or 0.0)
         return {
             "node_id": self.node_id,
             "node_label": self.node_label,
             "boot_id": self.boot_id,
             "started_at": self.started_at,
             "uptime_seconds": round(max(now - self.started_at, 0.0), 3),
+            "lifecycle_state": self._current_lifecycle_state(),
+            "drain_requested_at": round(self.drain_requested_at, 3) if self.drain_requested_at else 0.0,
+            "drain_started_at": round(self.drain_started_at, 3) if self.drain_started_at else 0.0,
+            "drain_finished_at": round(self.drain_finished_at, 3) if self.drain_finished_at else 0.0,
+            "standby_entered_at": round(self.standby_entered_at, 3) if self.standby_entered_at else 0.0,
+            "last_task_received_at": round(self.last_task_received_at, 3) if self.last_task_received_at else 0.0,
+            "last_task_finished_at": round(self.last_task_finished_at, 3) if self.last_task_finished_at else 0.0,
+            "idle_since": round(self.idle_since, 3) if self.idle_since else 0.0,
+            "idle_seconds": round(idle_seconds, 3),
+            "accepting_new_tasks": bool(self.accepting_new_tasks),
+            "standby_reason": self.standby_reason,
+            "last_lease_at": round(self.last_lease_at, 3) if self.last_lease_at else 0.0,
+            "lease_expires_at": round(self.lease_expires_at, 3) if self.lease_expires_at else 0.0,
+            "lease_owner": self.lease_owner,
+            "pending_drain_reason": self.pending_drain_reason,
+            "idle_soft_recycle_count": self.idle_soft_recycle_count,
+            "idle_standby_count": self.idle_standby_count,
+            "manual_drain_count": self.manual_drain_count,
+            "lease_expired_standby_count": self.lease_expired_standby_count,
+            "last_idle_soft_cleanup_at": round(self._last_idle_soft_cleanup_at, 3) if self._last_idle_soft_cleanup_at else 0.0,
+            "standby_auto_resume": bool(self.standby_auto_resume),
+            "idle_soft_recycle_seconds": round(self.idle_soft_recycle_seconds, 3),
+            "idle_standby_seconds": round(self.idle_standby_seconds, 3),
+            "lease_ttl_seconds": round(self.lease_ttl_seconds, 3),
+            "idle_scan_interval_seconds": round(self.idle_scan_interval_seconds, 3),
+            "active_task_count": active_task_count,
+            "reserved_slots": reserved_slots,
+            "lease_expired": self._lease_expired(now),
             "init_count": self.init_count,
             "last_init_at": round(self.last_init_at, 3) if self.last_init_at else 0.0,
             "last_init_reason": self.last_init_reason,
@@ -290,6 +404,307 @@ class TurnstileAPIServer:
             "idle_entries": entries,
             "idle_indexes": [int(item[0]) for item in entries],
         }
+
+    def _should_enter_idle_soft_cleanup(self, now: float | None = None) -> bool:
+        if self.reinit_in_progress or not self.accepting_new_tasks:
+            return False
+        if self._current_lifecycle_state() != "active":
+            return False
+        if self.idle_soft_recycle_seconds <= 0:
+            return False
+        idle_state = self._refresh_idle_state(now)
+        if int(idle_state.get("active_task_count") or 0) > 0:
+            return False
+        if int(idle_state.get("reserved_slots") or 0) > 0:
+            return False
+        if float(idle_state.get("idle_seconds") or 0.0) < self.idle_soft_recycle_seconds:
+            return False
+        if self._last_idle_soft_cleanup_at and self.idle_since and self._last_idle_soft_cleanup_at >= self.idle_since:
+            return False
+        return True
+
+    def _should_enter_standby(self, now: float | None = None, due_to_lease: bool = False) -> bool:
+        if self.reinit_in_progress:
+            return False
+        if self._current_lifecycle_state() == "standby":
+            return False
+        idle_state = self._refresh_idle_state(now)
+        if int(idle_state.get("active_task_count") or 0) > 0:
+            return False
+        if int(idle_state.get("reserved_slots") or 0) > 0:
+            return False
+        if self.lifecycle_state == "draining" and self._pending_drain_enter_standby:
+            return True
+        if due_to_lease:
+            return True
+        if self.accepting_new_tasks and self.idle_standby_seconds > 0 and float(idle_state.get("idle_seconds") or 0.0) >= self.idle_standby_seconds:
+            return True
+        return False
+
+    async def _perform_idle_soft_cleanup(self, reason: str = "idle_soft_cleanup") -> dict[str, Any]:
+        async with self._lifecycle_lock:
+            if not self._should_enter_idle_soft_cleanup():
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "message": "idle_soft_cleanup_skipped",
+                    **self._build_node_runtime_snapshot(),
+                }
+            for index in range(1, self.thread_count + 1):
+                await self._cleanup_persistent_page(index)
+            self._last_idle_soft_cleanup_at = time.time()
+            self.idle_soft_recycle_count += 1
+            logger.info(f"节点 {self.node_id}: 已执行空闲软清理，原因={reason}")
+            return {
+                "ok": True,
+                "accepted": True,
+                "message": "idle_soft_cleanup_applied",
+                "reason": reason,
+                **self._build_node_runtime_snapshot(),
+            }
+
+    async def _enter_standby(
+        self,
+        reason: str,
+        requested_by: str = "unknown",
+        source: str = "lifecycle",
+        due_to_lease: bool = False,
+    ) -> dict[str, Any]:
+        async with self._lifecycle_lock:
+            return await self._enter_standby_locked(
+                reason=reason,
+                requested_by=requested_by,
+                source=source,
+                due_to_lease=due_to_lease,
+            )
+
+    async def _enter_standby_locked(
+        self,
+        reason: str,
+        requested_by: str = "unknown",
+        source: str = "lifecycle",
+        due_to_lease: bool = False,
+    ) -> dict[str, Any]:
+        if self._current_lifecycle_state() == "standby":
+            self.accepting_new_tasks = False
+            if reason:
+                self.standby_reason = reason
+            return {
+                "ok": True,
+                "accepted": True,
+                "message": "already_standby",
+                "reason": reason,
+                **self._build_node_runtime_snapshot(),
+            }
+
+        slot_snapshot = await self._collect_all_browser_slots()
+        idle_entries = list(slot_snapshot.get("idle_entries") or [])
+        active_task_count = int(slot_snapshot.get("active_task_count") or 0)
+        reserved_slots = int(slot_snapshot.get("reserved_slots") or 0)
+        if active_task_count > 0 or reserved_slots > 0 or self.reinit_in_progress:
+            await self._restore_browser_entries(idle_entries)
+            return {
+                "ok": False,
+                "accepted": False,
+                "message": "standby_delayed",
+                "reason": reason,
+                "requested_by": requested_by,
+                "source": source,
+                **self._build_node_runtime_snapshot(),
+            }
+
+        idle_indexes = [int(item[0]) for item in idle_entries]
+        for index, browser, _config, _task_count in idle_entries:
+            await self._cleanup_persistent_page(index)
+            await self._close_browser_instance(browser)
+
+        await self._reset_solver_runtime(browser_indices=list(range(1, self.thread_count + 1)), reset_metrics=False)
+        entered_at = time.time()
+        self.accepting_new_tasks = False
+        if self.lifecycle_state == "draining":
+            self.drain_finished_at = entered_at
+            if not self.pending_drain_reason:
+                self.pending_drain_reason = reason
+        else:
+            self.pending_drain_reason = ""
+        self.lifecycle_state = "standby"
+        self.standby_entered_at = entered_at
+        self.standby_reason = reason or "idle_standby"
+        self.idle_standby_count += 1
+        self._last_idle_soft_cleanup_at = entered_at
+        if due_to_lease:
+            self.lease_expired_standby_count += 1
+        logger.warning(
+            f"节点 {self.node_id}: 已进入 standby，原因={self.standby_reason}，"
+            f"requested_by={requested_by or 'unknown'}，source={source or 'lifecycle'}，"
+            f"关闭 {len(idle_indexes)} 个浏览器位"
+        )
+        return {
+            "ok": True,
+            "accepted": True,
+            "message": "standby_entered",
+            "reason": self.standby_reason,
+            "requested_by": requested_by,
+            "source": source,
+            "closed_browsers": len(idle_indexes),
+            "drained_indexes": idle_indexes,
+            **self._build_node_runtime_snapshot(),
+        }
+
+    async def _mark_draining(
+        self,
+        reason: str,
+        requested_by: str,
+        source: str,
+        enter_standby: bool = True,
+        graceful: bool = True,
+        force_reinitialize_when_idle: bool = False,
+    ) -> dict[str, Any]:
+        async with self._lifecycle_lock:
+            now = time.time()
+            current_state = self._current_lifecycle_state()
+            self.accepting_new_tasks = False
+            self.pending_drain_reason = reason or "manual_drain"
+            self._pending_drain_enter_standby = bool(enter_standby)
+            self._pending_force_reinitialize_when_idle = bool(force_reinitialize_when_idle)
+            self.drain_requested_at = now
+            if current_state != "draining":
+                self.drain_started_at = now
+            self.manual_drain_count += 1
+
+            if current_state == "standby":
+                self.standby_reason = self.pending_drain_reason or self.standby_reason
+                self.drain_finished_at = now
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "message": "already_standby",
+                    "reason": self.standby_reason,
+                    "graceful": bool(graceful),
+                    "force_reinitialize_when_idle": bool(force_reinitialize_when_idle),
+                    **self._build_node_runtime_snapshot(),
+                }
+
+            self.lifecycle_state = "draining"
+            self.standby_reason = ""
+            idle_state = self._refresh_idle_state(now)
+            active_task_count = int(idle_state.get("active_task_count") or 0)
+            reserved_slots = int(idle_state.get("reserved_slots") or 0)
+            logger.warning(
+                f"节点 {self.node_id}: 开始 draining，原因={self.pending_drain_reason}，"
+                f"requested_by={requested_by or 'unknown'}，source={source or 'remote_admin'}，"
+                f"active_tasks={active_task_count}，reserved_slots={reserved_slots}"
+            )
+
+            if active_task_count <= 0 and reserved_slots <= 0 and enter_standby:
+                return await self._enter_standby_locked(
+                    reason=self.pending_drain_reason or "manual_drain",
+                    requested_by=requested_by,
+                    source=source,
+                    due_to_lease=False,
+                )
+
+            return {
+                "ok": True,
+                "accepted": True,
+                "message": "drain_started",
+                "reason": self.pending_drain_reason,
+                "graceful": bool(graceful),
+                "force_reinitialize_when_idle": bool(force_reinitialize_when_idle),
+                **self._build_node_runtime_snapshot(),
+            }
+
+    async def _resume_from_standby_if_needed(
+        self,
+        reason: str = "manual_resume",
+        requested_by: str = "unknown",
+        source: str = "lifecycle",
+    ) -> dict[str, Any]:
+        async with self._lifecycle_lock:
+            if self.reinit_in_progress:
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "message": "reinitialize_in_progress",
+                    **self._build_node_runtime_snapshot(),
+                }
+
+            current_state = self._current_lifecycle_state()
+            active_task_count = self._active_task_count()
+            if current_state == "active" and self.accepting_new_tasks:
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "message": "already_active",
+                    "resumed": False,
+                    **self._build_node_runtime_snapshot(),
+                }
+
+            initialized_browsers = 0
+            if self.browser_pool.qsize() <= 0 and active_task_count <= 0:
+                await self._initialize_browser(indices=list(range(1, self.thread_count + 1)))
+                initialized_browsers = self.thread_count
+
+            resumed_at = time.time()
+            self.accepting_new_tasks = True
+            self.lifecycle_state = "active"
+            self.standby_entered_at = 0.0
+            self.standby_reason = ""
+            self.pending_drain_reason = ""
+            self._pending_drain_enter_standby = True
+            self._pending_force_reinitialize_when_idle = False
+            self.drain_finished_at = resumed_at if current_state in {"draining", "standby"} else self.drain_finished_at
+            self.lease_expires_at = resumed_at + self.lease_ttl_seconds
+            self._refresh_idle_state(resumed_at)
+            logger.info(
+                f"节点 {self.node_id}: 已恢复 active，原因={reason}，"
+                f"requested_by={requested_by or 'unknown'}，source={source or 'lifecycle'}，"
+                f"初始化 {initialized_browsers} 个浏览器位"
+            )
+            return {
+                "ok": True,
+                "accepted": True,
+                "message": "resume_applied",
+                "reason": reason,
+                "requested_by": requested_by,
+                "source": source,
+                "resumed": True,
+                "initialized_browsers": initialized_browsers,
+                **self._build_node_runtime_snapshot(),
+            }
+
+    async def _idle_lifecycle_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.idle_scan_interval_seconds)
+                now = time.time()
+                self._refresh_idle_state(now)
+                if self._lease_expired(now) and self._should_enter_standby(now=now, due_to_lease=True):
+                    await self._enter_standby(
+                        reason="lease_expired_standby",
+                        requested_by=self.lease_owner or "lease_watchdog",
+                        source="idle_lifecycle",
+                        due_to_lease=True,
+                    )
+                    continue
+                if self.lifecycle_state == "draining" and self._should_enter_standby(now=now):
+                    await self._enter_standby(
+                        reason=self.pending_drain_reason or "drain_completed",
+                        requested_by="drain_watchdog",
+                        source="idle_lifecycle",
+                    )
+                    continue
+                if self._should_enter_idle_soft_cleanup(now=now):
+                    await self._perform_idle_soft_cleanup(reason="idle_soft_timeout")
+                    continue
+                if self._should_enter_standby(now=now):
+                    await self._enter_standby(
+                        reason="idle_standby_timeout",
+                        requested_by="idle_watchdog",
+                        source="idle_lifecycle",
+                    )
+            except Exception as e:
+                logger.error(f"空闲生命周期巡检出错: {e}")
 
     async def _reset_solver_runtime(self, browser_indices: list[int] | None = None, reset_metrics: bool = False):
         target_indices = [int(i) for i in (browser_indices or list(range(1, self.thread_count + 1)))]
@@ -600,6 +1015,7 @@ class TurnstileAPIServer:
         now = time.time()
         state = self._task_states.get(task_id, {})
         created_at = state.get("created_at", now)
+        normalized_status = str(status or "").strip().lower()
         state.update({
             "task_id": task_id,
             "status": status,
@@ -615,6 +1031,20 @@ class TurnstileAPIServer:
         if extra.get("elapsed_time") is None:
             state["elapsed_time"] = round(max(now - created_at, 0), 3)
         self._task_states[task_id] = state
+        if normalized_status in {"completed", "failed"}:
+            self.last_task_finished_at = now
+        self._refresh_idle_state(now)
+        if normalized_status in {"completed", "failed"} and self.lifecycle_state == "draining" and self._should_enter_standby(now=now):
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._enter_standby(
+                        reason=self.pending_drain_reason or "drain_completed",
+                        requested_by="task_state",
+                        source="task_state",
+                    )
+                )
+            except RuntimeError:
+                pass
 
     def _build_task_state_payload(self, task_id: str):
         state = self._task_states.get(task_id)
@@ -825,6 +1255,7 @@ class TurnstileAPIServer:
             self.last_init_reason = "startup"
             self.last_init_result = "success"
             asyncio.create_task(self._periodic_cleanup())
+            asyncio.create_task(self._idle_lifecycle_loop())
         except Exception as e:
             self.last_init_at = time.time()
             self.last_init_reason = "startup"
@@ -1355,6 +1786,121 @@ class TurnstileAPIServer:
             status_code = 503
         return jsonify(result), status_code
 
+    async def admin_drain(self):
+        """管理接口：停止接新单并等待节点排空"""
+        if not self._admin_token:
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "drain_disabled",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
+        if not self._is_admin_authorized():
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "unauthorized",
+            }), 401
+
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        reason = str(payload.get("reason") or "manual_drain").strip()[:120]
+        requested_by = str(payload.get("requested_by") or "unknown").strip()[:120]
+        source = str(payload.get("source") or "remote_admin").strip()[:120]
+        enter_standby = bool(payload.get("enter_standby", True))
+        graceful = False if payload.get("graceful") is False else True
+        force_reinitialize_when_idle = bool(payload.get("force_reinitialize_when_idle"))
+        result = await self._mark_draining(
+            reason=reason,
+            requested_by=requested_by,
+            source=source,
+            enter_standby=enter_standby,
+            graceful=graceful,
+            force_reinitialize_when_idle=force_reinitialize_when_idle,
+        )
+        message = str(result.get("message") or "")
+        status_code = 200 if result.get("ok") else (202 if message in {"standby_delayed"} else 409)
+        if message == "drain_disabled":
+            status_code = 503
+        return jsonify(result), status_code
+
+    async def admin_resume(self):
+        """管理接口：解除 draining / standby 并恢复接单"""
+        if not self._admin_token:
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "resume_disabled",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
+        if not self._is_admin_authorized():
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "unauthorized",
+            }), 401
+
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        reason = str(payload.get("reason") or "manual_resume").strip()[:120]
+        requested_by = str(payload.get("requested_by") or "unknown").strip()[:120]
+        source = str(payload.get("source") or "remote_admin").strip()[:120]
+        result = await self._resume_from_standby_if_needed(
+            reason=reason,
+            requested_by=requested_by,
+            source=source,
+        )
+        message = str(result.get("message") or "")
+        status_code = 200 if result.get("ok") else (503 if message == "resume_disabled" else 409)
+        return jsonify(result), status_code
+
+    async def admin_lease(self):
+        """管理接口：续租当前注册端租约"""
+        if not self._admin_token:
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "lease_disabled",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
+        if not self._is_admin_authorized():
+            return jsonify({
+                "ok": False,
+                "accepted": False,
+                "message": "unauthorized",
+            }), 401
+
+        payload = await request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        lease_owner = str(payload.get("lease_owner") or self.lease_owner or "unknown").strip()[:120]
+        reason = str(payload.get("reason") or "register_heartbeat").strip()[:120]
+        try:
+            lease_ttl_seconds = max(float(payload.get("lease_ttl_seconds") or self.lease_ttl_seconds), 5.0)
+        except Exception:
+            lease_ttl_seconds = self.lease_ttl_seconds
+
+        async with self._lifecycle_lock:
+            now = time.time()
+            self.last_lease_at = now
+            self.lease_expires_at = now + lease_ttl_seconds
+            self.lease_owner = lease_owner
+            snapshot = self._build_node_runtime_snapshot()
+
+        return jsonify({
+            "ok": True,
+            "accepted": True,
+            "message": "lease_renewed",
+            "reason": reason,
+            "lease_ttl_seconds": round(lease_ttl_seconds, 3),
+            **snapshot,
+        }), 200
+
     async def process_turnstile(self):
         """处理 /turnstile 请求，创建解题任务"""
         url = request.args.get('url')
@@ -1372,6 +1918,48 @@ class TurnstileAPIServer:
                 **self._build_node_runtime_snapshot(),
             }), 503
 
+        lifecycle_state = self._current_lifecycle_state()
+        if lifecycle_state == "draining" or (not self.accepting_new_tasks and lifecycle_state != "standby"):
+            return jsonify({
+                "status": "draining",
+                "stage": "draining",
+                "error": "solver_draining",
+                "message": "节点正在排空，暂不接收新任务",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
+        if lifecycle_state == "standby":
+            if not self.standby_auto_resume:
+                return jsonify({
+                    "status": "standby",
+                    "stage": "standby",
+                    "error": "solver_standby",
+                    "message": "节点处于待机状态，等待显式恢复",
+                    **self._build_node_runtime_snapshot(),
+                }), 503
+            resume_result = await self._resume_from_standby_if_needed(
+                reason="turnstile_auto_resume",
+                requested_by="turnstile_request",
+                source="process_turnstile",
+            )
+            if not resume_result.get("ok"):
+                return jsonify({
+                    "status": "busy",
+                    "stage": "standby_waking",
+                    "error": "solver_standby_resume_failed",
+                    "message": str(resume_result.get("message") or "standby_resume_failed"),
+                    **resume_result,
+                }), 503
+
+        if not self.accepting_new_tasks:
+            return jsonify({
+                "status": "draining",
+                "stage": "draining",
+                "error": "solver_draining",
+                "message": "节点暂不接收新任务",
+                **self._build_node_runtime_snapshot(),
+            }), 503
+
         reservation = await self._reserve_solver_slot()
         if not reservation:
             raw_available = self.browser_pool.qsize()
@@ -1385,8 +1973,11 @@ class TurnstileAPIServer:
                 "raw_available_browsers": raw_available,
                 "reserved_slots": self._reserved_slots,
                 "total_browsers": self.thread_count,
+                **self._build_node_runtime_snapshot(),
             }), 503
 
+        self.last_task_received_at = time.time()
+        self._last_idle_soft_cleanup_at = 0.0
         task_id = str(uuid.uuid4())
         self._set_task_state(task_id, "queued", "accepted", "任务已创建，等待浏览器分配", url=url)
         logger.info(f"新任务: {task_id[:8]}... URL={url} sitekey={sitekey[:10]}...")
@@ -1400,6 +1991,7 @@ class TurnstileAPIServer:
             "stage": "accepted",
             "message": "任务已创建，等待浏览器分配",
             **reservation,
+            **self._build_node_runtime_snapshot(),
         })
 
     async def get_result(self):
@@ -1475,8 +2067,9 @@ class TurnstileAPIServer:
         raw_available = self.browser_pool.qsize()
         effective_available = self._effective_available_browsers()
         health = self._build_health_snapshot()
+        lifecycle_state = self._current_lifecycle_state()
         return jsonify({
-            "status": "reinitializing" if self.reinit_in_progress else "running",
+            "status": "running" if lifecycle_state == "active" else lifecycle_state,
             "browser_type": self.browser_type,
             "available_browsers": effective_available,
             "raw_available_browsers": raw_available,
