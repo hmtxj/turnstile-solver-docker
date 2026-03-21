@@ -146,6 +146,12 @@ class TurnstileAPIServer:
         self.last_reinit_error = ""
         self.last_reinit_status = ""
         self.last_reinit_message = ""
+        self.last_reinit_mode = ""
+        self.last_reinit_trigger_summary = ""
+        self.last_force_reinit_at = 0.0
+        self.force_reinit_count = 0
+        self.last_rebuild_browser_count = 0
+        self.last_reinit_drained_indexes: list[int] = []
         self.reinit_in_progress = False
         self.reinit_cooldown_until = 0.0
         self._setup_routes()
@@ -211,6 +217,12 @@ class TurnstileAPIServer:
             "last_reinit_error": self.last_reinit_error,
             "last_reinit_status": self.last_reinit_status,
             "last_reinit_message": self.last_reinit_message,
+            "last_reinit_mode": self.last_reinit_mode,
+            "last_reinit_trigger_summary": self.last_reinit_trigger_summary,
+            "last_force_reinit_at": round(self.last_force_reinit_at, 3) if self.last_force_reinit_at else 0.0,
+            "force_reinit_count": self.force_reinit_count,
+            "last_rebuild_browser_count": self.last_rebuild_browser_count,
+            "last_reinit_drained_indexes": list(self.last_reinit_drained_indexes),
             "reinit_in_progress": self.reinit_in_progress,
             "reinit_cooldown_until": round(self.reinit_cooldown_until, 3) if self.reinit_cooldown_until else 0.0,
             "reinit_cooldown_remaining": round(self._reinit_cooldown_remaining(), 3),
@@ -247,16 +259,53 @@ class TurnstileAPIServer:
             drained_indexes.append(index)
         return drained_indexes
 
-    async def _reset_solver_runtime(self):
-        for index in list(self._persistent_pages.keys()):
+    async def _restore_browser_entries(self, entries: list[tuple]):
+        for entry in entries:
+            await self.browser_pool.put(entry)
+
+    def _active_task_count(self) -> int:
+        return sum(
+            1
+            for state in self._task_states.values()
+            if str((state or {}).get("status") or "").strip().lower() not in {"completed", "failed"}
+        )
+
+    async def _collect_all_browser_slots(self) -> dict[str, Any]:
+        raw_available = self.browser_pool.qsize()
+        effective_available = self._effective_available_browsers()
+        reserved_slots = self._reserved_slots
+        active_task_count = self._active_task_count()
+        entries: list[tuple] = []
+        while True:
+            try:
+                entries.append(self.browser_pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return {
+            "raw_available_browsers_before_drain": raw_available,
+            "available_browsers_before_drain": effective_available,
+            "active_browser_count": max(self.thread_count - raw_available, 0),
+            "active_task_count": active_task_count,
+            "reserved_slots": reserved_slots,
+            "idle_entries": entries,
+            "idle_indexes": [int(item[0]) for item in entries],
+        }
+
+    async def _reset_solver_runtime(self, browser_indices: list[int] | None = None, reset_metrics: bool = False):
+        target_indices = [int(i) for i in (browser_indices or list(range(1, self.thread_count + 1)))]
+        for index in target_indices:
             await self._cleanup_persistent_page(index)
-        self._persistent_pages.clear()
-        self._recent_results.clear()
-        self._restart_events.clear()
-        self._consecutive_fails.clear()
-        self._browser_runtime = {}
-        async with self._admission_lock:
-            self._reserved_slots = 0
+            runtime = self._get_browser_runtime(index)
+            runtime.clear()
+            runtime.update(self._build_browser_runtime_defaults())
+            self._consecutive_fails.pop(index, None)
+
+        if reset_metrics:
+            self._recent_results.clear()
+            self._restart_events.clear()
+            async with self._admission_lock:
+                if self.browser_pool.qsize() >= self.thread_count:
+                    self._reserved_slots = 0
 
     async def _create_browser_entry(self, index: int) -> tuple:
         if self.browser_type == "camoufox":
@@ -289,13 +338,102 @@ class TurnstileAPIServer:
         runtime["task_count"] = 0
         return (index, browser, config, 0)
 
-    async def _reinitialize_solver(self, reason: str, requested_by: str, source: str) -> dict[str, Any]:
+    def _should_allow_force_reinit(self, allow_force: bool = False, direct_unavailable_streak: int = 0) -> tuple[bool, str, dict[str, Any]]:
+        health = self._build_health_snapshot()
+        raw_available = self.browser_pool.qsize()
+        effective_available = self._effective_available_browsers()
+        streak_threshold = max(2, self.thread_count)
+        health_status = str(health.get("node_health_status") or "")
+        degraded_reason = str(health.get("node_degraded_reason") or "")
+        recent_timeout_count = int(health.get("recent_timeout_count") or 0)
+
+        if not allow_force:
+            return False, "force_not_requested", health
+        if effective_available > 0:
+            return False, "idle_browsers_still_available", health
+        if self.thread_count <= 1 and raw_available <= 0 and health_status in {"degraded", "cooling", "recovering"}:
+            return True, "", health
+        if direct_unavailable_streak >= streak_threshold and raw_available <= 0:
+            return True, "", health
+        if health_status in {"degraded", "cooling"} and recent_timeout_count > 0 and raw_available <= 0:
+            return True, "", health
+        if degraded_reason in {"recent_timeout_spike", "recent_fail_spike", "health_score_low", "cooldown_after_failures"} and raw_available <= 0:
+            return True, "", health
+        return False, "force_conditions_not_met", health
+
+    async def _force_rebuild_all_browsers(self, reason: str, trigger_summary: str = "") -> dict[str, Any]:
+        slot_snapshot = await self._collect_all_browser_slots()
+        idle_entries = list(slot_snapshot.get("idle_entries") or [])
+        idle_indexes = [int(item[0]) for item in idle_entries]
+        active_browser_count = int(slot_snapshot.get("active_browser_count") or 0)
+        active_task_count = int(slot_snapshot.get("active_task_count") or 0)
+        reserved_slots = int(slot_snapshot.get("reserved_slots") or 0)
+
+        if active_task_count > 0 or reserved_slots > 0:
+            await self._restore_browser_entries(idle_entries)
+            logger.warning(
+                f"节点 {self.node_id}: force 初始化延后，active_tasks={active_task_count}, "
+                f"active_browsers={active_browser_count}, reserved_slots={reserved_slots}"
+            )
+            return {
+                "ok": False,
+                "accepted": False,
+                "message": "reinitialize_delayed",
+                "active_browser_count": active_browser_count,
+                "active_task_count": active_task_count,
+                "reserved_slots": reserved_slots,
+                "drained_indexes": idle_indexes,
+            }
+
+        for index, browser, _config, _task_count in idle_entries:
+            await self._cleanup_persistent_page(index)
+            await self._close_browser_instance(browser)
+
+        rebuilt_indices = list(range(1, self.thread_count + 1))
+        await self._reset_solver_runtime(browser_indices=rebuilt_indices, reset_metrics=True)
+        await self._initialize_browser(indices=rebuilt_indices)
+        return {
+            "ok": True,
+            "accepted": True,
+            "message": f"force_reinitialized_{len(rebuilt_indices)}_browsers",
+            "reinitialized_browsers": len(rebuilt_indices),
+            "drained_indexes": idle_indexes,
+            "active_browser_count": active_browser_count,
+            "active_task_count": active_task_count,
+            "reserved_slots": reserved_slots,
+            "trigger_summary": (trigger_summary or "")[:240],
+            "reason": reason,
+        }
+
+    async def _reinitialize_solver(
+        self,
+        reason: str,
+        requested_by: str,
+        source: str,
+        mode: str = "soft",
+        allow_force: bool = False,
+        trigger_summary: str = "",
+        direct_unavailable_streak: int = 0,
+    ) -> dict[str, Any]:
         async with self._reinit_lock:
+            requested_mode = str(mode or "soft").strip().lower()
+            if requested_mode not in {"soft", "force"}:
+                requested_mode = "soft"
+            force_requested = bool(allow_force or requested_mode == "force")
+            trigger_summary = str(trigger_summary or "").strip()[:240]
+            try:
+                direct_unavailable_streak = max(int(direct_unavailable_streak or 0), 0)
+            except Exception:
+                direct_unavailable_streak = 0
+
             if self.reinit_in_progress:
                 return {
                     "ok": False,
                     "accepted": False,
                     "message": "reinitialize_already_running",
+                    "requested_mode": requested_mode,
+                    "effective_mode": "",
+                    "allow_force": force_requested,
                     **self._build_node_runtime_snapshot(),
                 }
 
@@ -308,8 +446,17 @@ class TurnstileAPIServer:
                     "accepted": False,
                     "message": "reinitialize_cooldown",
                     "cooldown_remaining": round(cooldown_remaining, 3),
+                    "requested_mode": requested_mode,
+                    "effective_mode": "",
+                    "allow_force": force_requested,
                     **self._build_node_runtime_snapshot(),
                 }
+
+            force_allowed, force_block_reason, _health = self._should_allow_force_reinit(
+                allow_force=force_requested,
+                direct_unavailable_streak=direct_unavailable_streak,
+            )
+            effective_mode = "force" if force_allowed else "soft"
 
             self.reinit_in_progress = True
             self.last_reinit_requested_by = requested_by
@@ -319,33 +466,93 @@ class TurnstileAPIServer:
             self.last_reinit_error = ""
             self.last_reinit_status = "running"
             self.last_reinit_message = reason or "remote_reinitialize"
-            self.last_init_reason = reason or "remote_reinitialize"
+            self.last_reinit_trigger_summary = trigger_summary
+            self.last_rebuild_browser_count = 0
+            self.last_reinit_drained_indexes = []
+            self.last_init_reason = reason or f"remote_reinitialize_{effective_mode}"
             self.last_init_result = "running"
-            logger.warning(f"节点 {self.node_id}: 收到远程软初始化请求，原因={reason or 'remote_reinitialize'}，来源={requested_by or 'unknown'}")
+            logger.warning(
+                f"节点 {self.node_id}: 收到远程初始化请求，原因={reason or 'remote_reinitialize'}，"
+                f"来源={requested_by or 'unknown'}，请求模式={requested_mode}，执行模式={effective_mode}"
+            )
 
             try:
+                if effective_mode == "force":
+                    result = await self._force_rebuild_all_browsers(reason=reason, trigger_summary=trigger_summary)
+                    self.last_reinit_drained_indexes = [int(i) for i in list(result.get("drained_indexes") or [])]
+                    self.last_rebuild_browser_count = int(result.get("reinitialized_browsers") or 0)
+                    if not result.get("ok"):
+                        self.last_reinit_finished_at = time.time()
+                        self.last_reinit_status = "delayed" if result.get("message") == "reinitialize_delayed" else "skipped"
+                        self.last_reinit_message = str(result.get("message") or "force_reinit_not_allowed")
+                        self.last_init_result = "delayed" if result.get("message") == "reinitialize_delayed" else "skipped"
+                        return {
+                            **result,
+                            "requested_mode": requested_mode,
+                            "effective_mode": effective_mode,
+                            "allow_force": force_requested,
+                            "force_allowed": force_allowed,
+                            "force_block_reason": force_block_reason,
+                            "trigger_summary": trigger_summary,
+                            "direct_unavailable_streak": direct_unavailable_streak,
+                            **self._build_node_runtime_snapshot(),
+                        }
+
+                    self.init_count += 1
+                    self.last_init_at = time.time()
+                    self.last_init_result = "success"
+                    self.last_reinit_finished_at = self.last_init_at
+                    self.last_reinit_status = "success"
+                    self.last_reinit_message = str(result.get("message") or f"force_reinitialized_{self.last_rebuild_browser_count}_browsers")
+                    self.last_reinit_mode = "force"
+                    self.last_force_reinit_at = self.last_init_at
+                    self.force_reinit_count += 1
+                    self.reinit_cooldown_until = time.time() + self.reinit_cooldown_seconds
+                    logger.success(f"节点 {self.node_id}: 强制初始化成功，重建 {self.last_rebuild_browser_count} 个浏览器位")
+                    return {
+                        **result,
+                        "requested_mode": requested_mode,
+                        "effective_mode": "force",
+                        "allow_force": force_requested,
+                        "force_allowed": True,
+                        "force_block_reason": "",
+                        "trigger_summary": trigger_summary,
+                        "direct_unavailable_streak": direct_unavailable_streak,
+                        **self._build_node_runtime_snapshot(),
+                    }
+
                 drained_indexes = await self._drain_idle_browser_pool()
+                self.last_reinit_drained_indexes = list(drained_indexes)
                 if not drained_indexes:
-                    self.reinit_in_progress = False
                     self.last_reinit_finished_at = time.time()
                     self.last_reinit_status = "skipped"
-                    self.last_reinit_message = "no_idle_browsers_to_reinitialize"
+                    skip_message = "force_reinit_not_allowed" if force_requested else "no_idle_browsers_to_reinitialize"
+                    self.last_reinit_message = skip_message
                     self.last_init_result = "skipped"
                     return {
                         "ok": False,
                         "accepted": False,
-                        "message": "no_idle_browsers_to_reinitialize",
+                        "message": skip_message,
+                        "requested_mode": requested_mode,
+                        "effective_mode": effective_mode,
+                        "allow_force": force_requested,
+                        "force_allowed": force_allowed,
+                        "force_block_reason": force_block_reason,
+                        "trigger_summary": trigger_summary,
+                        "direct_unavailable_streak": direct_unavailable_streak,
                         **self._build_node_runtime_snapshot(),
                     }
 
-                await self._reset_solver_runtime()
+                await self._reset_solver_runtime(browser_indices=drained_indexes, reset_metrics=True)
                 await self._initialize_browser(indices=drained_indexes)
+                self.last_rebuild_browser_count = len(drained_indexes)
                 self.init_count += 1
                 self.last_init_at = time.time()
                 self.last_init_result = "success"
                 self.last_reinit_finished_at = self.last_init_at
                 self.last_reinit_status = "success"
-                self.last_reinit_message = f"reinitialized_{len(drained_indexes)}_browsers"
+                self.last_reinit_message = f"soft_reinitialized_{len(drained_indexes)}_browsers"
+                self.last_reinit_mode = "soft"
                 self.reinit_cooldown_until = time.time() + self.reinit_cooldown_seconds
                 logger.success(f"节点 {self.node_id}: 软初始化成功，重建 {len(drained_indexes)} 个空闲浏览器实例")
                 return {
@@ -353,6 +560,14 @@ class TurnstileAPIServer:
                     "accepted": True,
                     "message": self.last_reinit_message,
                     "reinitialized_browsers": len(drained_indexes),
+                    "drained_indexes": list(drained_indexes),
+                    "requested_mode": requested_mode,
+                    "effective_mode": "soft",
+                    "allow_force": force_requested,
+                    "force_allowed": force_allowed,
+                    "force_block_reason": force_block_reason,
+                    "trigger_summary": trigger_summary,
+                    "direct_unavailable_streak": direct_unavailable_streak,
                     **self._build_node_runtime_snapshot(),
                 }
             except Exception as e:
@@ -363,12 +578,19 @@ class TurnstileAPIServer:
                 self.last_init_at = self.last_reinit_finished_at
                 self.last_init_result = "failed"
                 self.reinit_cooldown_until = time.time() + self.reinit_cooldown_seconds
-                logger.error(f"节点 {self.node_id}: 软初始化失败: {e}")
+                logger.error(f"节点 {self.node_id}: {effective_mode} 初始化失败: {e}")
                 return {
                     "ok": False,
                     "accepted": False,
                     "message": "reinitialize_failed",
                     "error": str(e),
+                    "requested_mode": requested_mode,
+                    "effective_mode": effective_mode,
+                    "allow_force": force_requested,
+                    "force_allowed": force_allowed,
+                    "force_block_reason": force_block_reason,
+                    "trigger_summary": trigger_summary,
+                    "direct_unavailable_streak": direct_unavailable_streak,
                     **self._build_node_runtime_snapshot(),
                 }
             finally:
@@ -405,25 +627,28 @@ class TurnstileAPIServer:
         payload.setdefault("solution", None)
         return payload
 
+    def _build_browser_runtime_defaults(self) -> dict[str, Any]:
+        return {
+            "task_count": 0,
+            "page_reuse_count": 0,
+            "consecutive_failures": 0,
+            "recent_failures": 0,
+            "last_success_at": 0.0,
+            "last_failure_at": 0.0,
+            "last_restart_at": 0.0,
+            "recovering_until": 0.0,
+            "cooling_until": 0.0,
+            "force_recycle_page": False,
+            "last_outcome": "",
+            "last_message": "",
+            "restart_count": 0,
+            "recycle_count": 0,
+        }
+
     def _get_browser_runtime(self, index: int) -> dict:
         runtime = self._browser_runtime.get(index)
         if runtime is None:
-            runtime = {
-                "task_count": 0,
-                "page_reuse_count": 0,
-                "consecutive_failures": 0,
-                "recent_failures": 0,
-                "last_success_at": 0.0,
-                "last_failure_at": 0.0,
-                "last_restart_at": 0.0,
-                "recovering_until": 0.0,
-                "cooling_until": 0.0,
-                "force_recycle_page": False,
-                "last_outcome": "",
-                "last_message": "",
-                "restart_count": 0,
-                "recycle_count": 0,
-            }
+            runtime = self._build_browser_runtime_defaults()
             self._browser_runtime[index] = runtime
         return runtime
 
@@ -1106,9 +1331,27 @@ class TurnstileAPIServer:
         reason = str(payload.get("reason") or "remote_reinitialize").strip()[:120]
         requested_by = str(payload.get("requested_by") or "unknown").strip()[:120]
         source = str(payload.get("source") or "remote_admin").strip()[:120]
-        result = await self._reinitialize_solver(reason=reason, requested_by=requested_by, source=source)
-        status_code = 200 if result.get("ok") else (202 if result.get("message") == "reinitialize_already_running" else 409)
-        if result.get("message") == "reinitialize_disabled":
+        mode = str(payload.get("mode") or "soft").strip().lower()
+        if mode not in {"soft", "force"}:
+            mode = "soft"
+        allow_force = bool(payload.get("allow_force")) or mode == "force"
+        trigger_summary = str(payload.get("trigger_summary") or "").strip()[:240]
+        try:
+            direct_unavailable_streak = max(int(payload.get("direct_unavailable_streak") or 0), 0)
+        except Exception:
+            direct_unavailable_streak = 0
+        result = await self._reinitialize_solver(
+            reason=reason,
+            requested_by=requested_by,
+            source=source,
+            mode=mode,
+            allow_force=allow_force,
+            trigger_summary=trigger_summary,
+            direct_unavailable_streak=direct_unavailable_streak,
+        )
+        message = str(result.get("message") or "")
+        status_code = 200 if result.get("ok") else (202 if message in {"reinitialize_already_running", "reinitialize_delayed"} else 409)
+        if message == "reinitialize_disabled":
             status_code = 503
         return jsonify(result), status_code
 
